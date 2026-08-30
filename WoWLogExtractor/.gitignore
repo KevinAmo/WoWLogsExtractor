@@ -1,0 +1,5 @@
+WoWCombatLog Extracted/
+config.json
+state.json
+__pycache__/
+*.pyc
