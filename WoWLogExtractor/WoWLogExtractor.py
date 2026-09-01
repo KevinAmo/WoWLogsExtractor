@@ -8,14 +8,19 @@ per Mythic+ run / raid pull (original bytes preserved) plus a .json metadata sid
 from __future__ import annotations
 
 import argparse
+import gzip as gzip_module
 import hashlib
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 import traceback
-from collections import deque
+import zipfile
+from collections import OrderedDict, deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 APP_NAME = "WoWLogExtractor"
@@ -37,6 +42,25 @@ MPLUS_DIR_NAME = "MPlus"
 RAID_DIR_NAME = "Raids"
 STATE_FILENAME = "state.json"
 CONFIG_FILENAME = "config.json"
+LOCK_FILENAME = ".output.lock"
+ANALYSIS_SCHEMA_VERSION = 1
+
+MAX_PLAYER_IDENTITIES = 256
+MAX_PLAYER_AGGREGATES = 80
+MAX_ACTOR_NAMES = 8192
+MAX_PET_OWNERS = 2048
+MAX_RELEVANT_HOSTILES = 4096
+MAX_ACTIVE_AURAS = 8192
+MAX_SPELL_AGGREGATES = 8192
+MAX_INTERRUPT_DETAILS = 10000
+MAX_DISPEL_DETAILS = 10000
+MAX_CAUSAL_LINES = 50000
+MAX_CAUSAL_BYTES = 64 * 1024 * 1024
+CAUSAL_SECONDS = 20
+DEATH_WINDOW_SECONDS = 12
+ACTOR_NAME_TTL_SECONDS = 300
+HOSTILE_TTL_SECONDS = 60
+GZIP_LEVEL = 9
 
 KIND_MPLUS = "mythic_plus"
 KIND_RAID = "raid"
@@ -64,6 +88,12 @@ def safe_print(message: str = "") -> None:
     except UnicodeEncodeError:
         encoding = getattr(sys.stdout, "encoding", None) or "ascii"
         print(message.encode(encoding, "replace").decode(encoding, "replace"))
+
+
+def format_megabytes(size: int | None) -> str:
+    if size is None:
+        return "not written"
+    return "%.1f MB" % (size / (1024 * 1024))
 
 
 def configure_stdio() -> None:
@@ -240,12 +270,942 @@ def _sha1(data: bytes) -> str:
 def _atomic_write_bytes(path: str, data: bytes) -> None:
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
-    temp_path = path + ".tmp"
-    with open(temp_path, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp_path, path)
+    descriptor, temp_path = tempfile.mkstemp(prefix=".%s." % os.path.basename(path),
+                                             suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+def _json_bytes(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _copy_atomic(source: str, destination: str) -> None:
+    directory = os.path.dirname(destination) or "."
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temp_path = tempfile.mkstemp(prefix=".%s." % os.path.basename(destination),
+                                             suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(descriptor, "wb") as target, open(source, "rb") as origin:
+            descriptor = -1
+            shutil.copyfileobj(origin, target, READ_BLOCK)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temp_path, destination)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+def _deterministic_gzip(source: str, destination: str) -> None:
+    with open(source, "rb") as origin, open(destination, "wb") as raw_target:
+        with gzip_module.GzipFile(filename="", mode="wb", fileobj=raw_target,
+                                  compresslevel=GZIP_LEVEL, mtime=0) as target:
+            shutil.copyfileobj(origin, target, READ_BLOCK)
+        raw_target.flush()
+        os.fsync(raw_target.fileno())
+
+
+@dataclass(frozen=True)
+class OutputOptions:
+    """Explicit output contract derived from the four analysis CLI switches."""
+
+    analysis: bool = False
+    analysis_only: bool = False
+    gzip: bool = False
+    bundle: bool = False
+
+    def __post_init__(self) -> None:
+        if self.analysis and self.analysis_only:
+            raise ValueError("--analysis and --analysis-only are mutually exclusive")
+        if self.bundle and not self.wants_analysis:
+            raise ValueError("--bundle requires --analysis or --analysis-only")
+
+    @property
+    def wants_analysis(self) -> bool:
+        return self.analysis or self.analysis_only
+
+    @property
+    def wants_full(self) -> bool:
+        return not self.analysis_only
+
+    @property
+    def is_legacy_default(self) -> bool:
+        return not (self.analysis or self.analysis_only or self.gzip or self.bundle)
+
+    @property
+    def profile(self) -> str:
+        if self.is_legacy_default:
+            return "full"
+        parts = ["analysis-only" if self.analysis_only else
+                 ("full+analysis" if self.analysis else "full")]
+        if self.gzip:
+            parts.append("gzip")
+        if self.bundle:
+            parts.append("bundle")
+        return "+".join(parts)
+
+    def as_dict(self) -> dict:
+        return {"full": self.wants_full, "analysis": self.wants_analysis,
+                "gzip": self.gzip, "bundle": self.bundle,
+                "profile": self.profile}
+
+
+class OutputLock:
+    """Cross-process exclusive lock for one complete output tree."""
+
+    def __init__(self, output_dir: str):
+        self.path = os.path.join(os.path.abspath(output_dir), LOCK_FILENAME)
+        self._handle = None
+        self._depth = 0
+
+    def acquire(self) -> None:
+        if self._handle is not None:
+            self._depth += 1
+            return
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        handle = open(self.path, "a+b")
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                try:
+                    import fcntl
+                except ImportError as exc:
+                    raise RuntimeError("no safe output locking primitive available") from exc
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, RuntimeError) as exc:
+            handle.close()
+            raise RuntimeError("output folder is already in use: %s" %
+                               os.path.dirname(self.path)) from exc
+        self._handle = handle
+        self._depth = 1
+
+    def release(self) -> None:
+        if self._depth > 1:
+            self._depth -= 1
+            return
+        handle, self._handle = self._handle, None
+        self._depth = 0
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        self.release()
+
+
+# --- tolerant combat parsing and bounded analysis --------------------------------
+
+STRUCTURAL_EVENTS = {
+    "COMBAT_LOG_VERSION", "ZONE_CHANGE", "MAP_CHANGE", "CHALLENGE_MODE_START",
+    "CHALLENGE_MODE_END", "ENCOUNTER_START", "ENCOUNTER_END", "COMBATANT_INFO",
+}
+ACTOR_EVENT_PREFIXES = (
+    "SPELL_", "RANGE_", "SWING_", "ENVIRONMENTAL_", "DAMAGE_", "UNIT_",
+    "PARTY_", "SPELL_EMPOWER_",
+)
+CAST_EVENTS = {"SPELL_CAST_START", "SPELL_CAST_SUCCESS", "SPELL_CAST_FAILED",
+               "SPELL_EMPOWER_START", "SPELL_EMPOWER_END", "SPELL_EMPOWER_INTERRUPT"}
+DAMAGE_EVENTS = {"SWING_DAMAGE", "RANGE_DAMAGE", "SPELL_DAMAGE",
+                 "SPELL_PERIODIC_DAMAGE", "ENVIRONMENTAL_DAMAGE",
+                 "DAMAGE_SHIELD", "DAMAGE_SPLIT"}
+HEAL_EVENTS = {"SPELL_HEAL", "SPELL_PERIODIC_HEAL"}
+AURA_APPLY_EVENTS = {"SPELL_AURA_APPLIED", "SPELL_AURA_REFRESH",
+                     "SPELL_AURA_APPLIED_DOSE"}
+AURA_REMOVE_EVENTS = {"SPELL_AURA_REMOVED", "SPELL_AURA_REMOVED_DOSE",
+                      "SPELL_AURA_BROKEN", "SPELL_AURA_BROKEN_SPELL"}
+SUMMON_EVENTS = {"SPELL_SUMMON", "SPELL_CREATE"}
+DISPEL_EVENTS = {"SPELL_DISPEL", "SPELL_STOLEN"}
+ALWAYS_KEEP_ACTOR_EVENTS = {"UNIT_DIED", "UNIT_DESTROYED", "PARTY_KILL"}
+DETAIL_EVENTS = CAST_EVENTS | DAMAGE_EVENTS | HEAL_EVENTS | AURA_APPLY_EVENTS | \
+    AURA_REMOVE_EVENTS | SUMMON_EVENTS | DISPEL_EVENTS | {
+        "SWING_MISSED", "RANGE_MISSED", "SPELL_MISSED", "SPELL_ABSORBED",
+        "SPELL_HEAL_ABSORBED", "SPELL_DISPEL_FAILED", "SPELL_INTERRUPT",
+        "UNIT_DIED", "UNIT_DESTROYED", "PARTY_KILL", "SPELL_RESURRECT",
+        "SPELL_ENERGIZE", "SPELL_DRAIN", "SPELL_LEECH",
+    }
+
+TYPE_PLAYER = 0x00000400
+TYPE_PET = 0x00001000
+TYPE_GUARDIAN = 0x00002000
+REACTION_HOSTILE = 0x00000040
+
+
+def _flags(value: str | None) -> int:
+    if value is None:
+        return 0
+    try:
+        return int(value.strip().strip('"'), 0)
+    except ValueError:
+        return 0
+
+
+def _is_player(guid: str | None, flags: int = 0) -> bool:
+    if not guid or guid in {"0000000000000000", "nil"}:
+        return False
+    return bool(guid.startswith("Player-") or flags & TYPE_PLAYER)
+
+
+def _is_pet(flags: int) -> bool:
+    return bool(flags & (TYPE_PET | TYPE_GUARDIAN))
+
+
+@dataclass
+class ParsedCombatEvent:
+    event: str
+    source_guid: str | None = None
+    source_name: str | None = None
+    source_flags: int = 0
+    destination_guid: str | None = None
+    destination_name: str | None = None
+    destination_flags: int = 0
+    spell_id: int | None = None
+    spell_name: str | None = None
+    amount: int | None = None
+    overheal: int | None = None
+    absorbed: int | None = None
+    extra_spell_id: int | None = None
+    extra_spell_name: str | None = None
+    aura_type: str | None = None
+    miss_type: str | None = None
+    target_hp: int | None = None
+    target_max_hp: int | None = None
+    target_owner_guid: str | None = None
+    x: float | None = None
+    y: float | None = None
+    parse_fallback: bool = False
+
+    @property
+    def source_is_player(self) -> bool:
+        return _is_player(self.source_guid, self.source_flags)
+
+    @property
+    def destination_is_player(self) -> bool:
+        return _is_player(self.destination_guid, self.destination_flags)
+
+    def as_dict(self, timestamp: datetime, raw: bytes,
+                death_timestamp: datetime | None = None) -> dict:
+        data = {"timestamp": format_timestamp(timestamp), "event": self.event,
+                "raw": raw.decode("utf-8", errors="replace").rstrip("\r\n")}
+        for key in ("source_guid", "source_name", "destination_guid",
+                    "destination_name", "spell_id", "spell_name", "amount",
+                    "overheal", "absorbed", "extra_spell_id", "extra_spell_name",
+                    "aura_type", "miss_type", "target_hp", "target_max_hp",
+                    "target_owner_guid", "x", "y"):
+            value = getattr(self, key)
+            if value is not None:
+                data[key] = value
+        if death_timestamp is not None:
+            data["seconds_before_death"] = round(
+                (death_timestamp - timestamp).total_seconds(), 3)
+        return data
+
+
+def _to_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value.strip().strip('"'))
+    except ValueError:
+        return None
+
+
+def _looks_like_guid(value: str | None) -> bool:
+    value = unquote(value)
+    return bool(value and ("-" in value or value in {"0000000000000000", "nil"}))
+
+
+def _advanced_state(payload: list[str], base: int) -> tuple[int, int, int, str | None,
+                                                            float | None,
+                                                            float | None] | None:
+    """Detect Retail's 19-field advanced target-state prefix."""
+    if len(payload) < base + 19 or not _looks_like_guid(arg_at(payload, base)):
+        return None
+    hp = to_int(arg_at(payload, base + 2))
+    maximum = to_int(arg_at(payload, base + 3))
+    if hp is None or maximum is None or maximum <= 0 or hp < 0:
+        return None
+    x = _to_float(arg_at(payload, base + 14))
+    y = _to_float(arg_at(payload, base + 15))
+    owner = unquote(arg_at(payload, base + 1)) or None
+    return base + 19, hp, maximum, owner, x, y
+
+
+def parse_combat_event(event: str, args: list[str]) -> ParsedCombatEvent:
+    parsed = ParsedCombatEvent(event=event)
+    if event == "COMBATANT_INFO":
+        parsed.source_guid = unquote(arg_at(args, 0))
+        # The spec is the integer immediately before the first talent-tree array.
+        # That survived the extra 12.0 stat field (older logs used one less column).
+        for index in range(20, len(args)):
+            if args[index].lstrip().startswith("["):
+                parsed.spell_id = to_int(arg_at(args, index - 1))
+                break
+        parsed.parse_fallback = parsed.source_guid is None
+        return parsed
+    if event not in DETAIL_EVENTS and event not in STRUCTURAL_EVENTS:
+        if not event.startswith(ACTOR_EVENT_PREFIXES):
+            return parsed
+    if event in STRUCTURAL_EVENTS:
+        return parsed
+    if len(args) < 8:
+        parsed.parse_fallback = True
+        return parsed
+    parsed.source_guid = unquote(args[0]) or None
+    parsed.source_name = unquote(args[1]) or None
+    parsed.source_flags = _flags(args[2])
+    parsed.destination_guid = unquote(args[4]) or None
+    parsed.destination_name = unquote(args[5]) or None
+    parsed.destination_flags = _flags(args[6])
+    payload = args[8:]
+    has_spell = event.startswith("SPELL_") or event.startswith("RANGE_") or \
+        event.startswith("DAMAGE_")
+    if has_spell and event not in {"SPELL_ABSORBED", "SPELL_HEAL_ABSORBED"}:
+        parsed.spell_id = to_int(arg_at(payload, 0))
+        parsed.spell_name = unquote(arg_at(payload, 1))
+    value_index = 3 if has_spell else 0
+    if event in DAMAGE_EVENTS | HEAL_EVENTS:
+        state_base = value_index
+        advanced = _advanced_state(payload, value_index)
+        if advanced is not None:
+            value_index, hp, maximum, owner, x, y = advanced
+            # SWING_DAMAGE's block describes the attacker, not the target. Avoid
+            # labelling source health/position as the victim's state.
+            if unquote(arg_at(payload, state_base)) == parsed.destination_guid:
+                parsed.target_hp, parsed.target_max_hp, parsed.x, parsed.y = \
+                    hp, maximum, x, y
+                parsed.target_owner_guid = owner
+    if event == "ENVIRONMENTAL_DAMAGE":
+        value_index += 1
+    if event in DAMAGE_EVENTS:
+        parsed.amount = to_int(arg_at(payload, value_index))
+        tail = payload[value_index:]
+        expected_school = 1 if event == "SWING_DAMAGE" else _flags(arg_at(payload, 2))
+        modern_damage = (event == "ENVIRONMENTAL_DAMAGE" and len(tail) >= 10) or \
+            bool(tail and unquote(tail[-1]) in {"ST", "AOE"})
+        if not modern_damage and len(tail) >= 11 and expected_school:
+            modern_damage = (_flags(arg_at(payload, value_index + 3)) == expected_school and
+                             _flags(arg_at(payload, value_index + 2)) != expected_school)
+        parsed.absorbed = to_int(arg_at(payload, value_index +
+                                       (6 if modern_damage else 5)))
+    elif event in HEAL_EVENTS:
+        # Modern Retail inserts healedToHP before amount even when advanced logging
+        # is disabled. Detect the five-field suffix rather than using the unrelated
+        # presence of the advanced state block as a version signal.
+        if len(payload) - value_index >= 5:
+            parsed.amount = to_int(arg_at(payload, value_index + 1))
+            parsed.overheal = to_int(arg_at(payload, value_index + 2))
+            parsed.absorbed = to_int(arg_at(payload, value_index + 3))
+        else:
+            parsed.amount = to_int(arg_at(payload, value_index))
+            parsed.overheal = to_int(arg_at(payload, value_index + 1))
+            parsed.absorbed = to_int(arg_at(payload, value_index + 2))
+    elif event.endswith("_MISSED"):
+        parsed.miss_type = unquote(arg_at(payload, value_index))
+    elif event in AURA_APPLY_EVENTS | AURA_REMOVE_EVENTS:
+        parsed.aura_type = unquote(arg_at(payload, 3))
+    elif event in {"SPELL_INTERRUPT", "SPELL_DISPEL", "SPELL_DISPEL_FAILED",
+                   "SPELL_STOLEN"}:
+        parsed.extra_spell_id = to_int(arg_at(payload, 3))
+        parsed.extra_spell_name = unquote(arg_at(payload, 4))
+    elif event == "SPELL_ABSORBED":
+        # Swing form starts with the absorber header; spell form prepends the
+        # attacking spell triplet. Both then carry shield triplet + amount.
+        shield_index = 4 if _looks_like_guid(arg_at(payload, 0)) else 7
+        if shield_index == 7:
+            parsed.spell_id = to_int(arg_at(payload, 0))
+            parsed.spell_name = unquote(arg_at(payload, 1))
+        parsed.extra_spell_id = to_int(arg_at(payload, shield_index))
+        parsed.extra_spell_name = unquote(arg_at(payload, shield_index + 1))
+        parsed.amount = to_int(arg_at(payload, shield_index + 3))
+        parsed.absorbed = parsed.amount
+    elif event == "SPELL_HEAL_ABSORBED":
+        parsed.spell_id = to_int(arg_at(payload, 0))
+        parsed.spell_name = unquote(arg_at(payload, 1))
+        parsed.extra_spell_id = to_int(arg_at(payload, 7))
+        parsed.extra_spell_name = unquote(arg_at(payload, 8))
+        parsed.amount = to_int(arg_at(payload, 10))
+        parsed.absorbed = parsed.amount
+    return parsed
+
+
+@dataclass
+class _AnalysisRecord:
+    timestamp: datetime
+    raw: bytes
+    parsed: ParsedCombatEvent
+    selected: bool = False
+    aggregated: bool = False
+
+
+def _new_player(guid: str, name: str | None) -> dict:
+    return {"guid": guid, "name": name, "spec_id": None, "role": None,
+            "item_level": None, "deaths": 0, "interrupts": 0, "dispels": 0,
+            "damage_done": 0, "damage_taken": 0, "healing_done": 0,
+            "healing_received": 0, "self_healing": 0, "absorbs_received": 0,
+            "pets": []}
+
+
+SPEC_ROLES = {
+    62: "DAMAGER", 63: "DAMAGER", 64: "DAMAGER",
+    65: "HEALER", 66: "TANK", 70: "DAMAGER",
+    71: "DAMAGER", 72: "DAMAGER", 73: "TANK",
+    102: "DAMAGER", 103: "DAMAGER", 104: "TANK", 105: "HEALER",
+    250: "TANK", 251: "DAMAGER", 252: "DAMAGER",
+    253: "DAMAGER", 254: "DAMAGER", 255: "DAMAGER",
+    256: "HEALER", 257: "HEALER", 258: "DAMAGER",
+    259: "DAMAGER", 260: "DAMAGER", 261: "DAMAGER",
+    262: "DAMAGER", 263: "DAMAGER", 264: "HEALER",
+    265: "DAMAGER", 266: "DAMAGER", 267: "DAMAGER",
+    268: "TANK", 269: "DAMAGER", 270: "HEALER",
+    577: "DAMAGER", 581: "TANK", 1467: "DAMAGER", 1468: "HEALER",
+    1473: "DAMAGER", 1480: "DAMAGER",
+}
+
+
+class AnalysisSession:
+    """One bounded, streaming analysis pipeline for a single extracted segment."""
+
+    def __init__(self, stage_dir: str, kind: str):
+        self.stage_dir = stage_dir
+        self.kind = kind
+        os.makedirs(stage_dir, exist_ok=True)
+        self.combat_raw_path = os.path.join(stage_dir, "combat.raw")
+        self.deaths_spool_path = os.path.join(stage_dir, "deaths.jsonl")
+        self._combat = open(self.combat_raw_path, "wb")
+        self._deaths = open(self.deaths_spool_path, "wb")
+        self.history: deque[_AnalysisRecord] = deque()
+        self.history_bytes = 0
+        self.dropped_intervals: deque[tuple[datetime, datetime]] = deque()
+        self.actor_names: OrderedDict[str, tuple[str | None, datetime]] = OrderedDict()
+        self.pet_owners: OrderedDict[str, str] = OrderedDict()
+        self.hostiles: OrderedDict[str, datetime] = OrderedDict()
+        self.active_auras: dict[tuple[str, int | None, str | None], dict] = {}
+        self.players: OrderedDict[str, dict] = OrderedDict()
+        self.player_identities: set[str] = set()
+        self.player_identity_truncated = False
+        self.spell_keys: set[tuple[str, int | None]] = set()
+        self.interrupts: list[dict] = []
+        self.dispels: list[dict] = []
+        self.enemy_cast_successes: dict[str, int] = {}
+        self.parse_fallbacks: dict[str, int] = {}
+        self.event_counts: dict[str, int] = {}
+        self.total_player_deaths = 0
+        self.total_interrupts = 0
+        self.total_dispels = 0
+        self.warnings: OrderedDict[str, dict] = OrderedDict()
+        self.persistent_incomplete: set[str] = set()
+        self.combat_lines = 0
+        self.combat_bytes = 0
+        self.current_encounter: dict | None = None
+
+    def _warn(self, code: str, cap: int, timestamp: datetime, incomplete: bool = False) -> None:
+        warning = self.warnings.get(code)
+        stamp = format_timestamp(timestamp)
+        if warning is None:
+            warning = {"code": code, "cap": cap, "dropped": 0,
+                       "first_timestamp": stamp, "last_timestamp": stamp}
+            self.warnings[code] = warning
+        warning["dropped"] += 1
+        warning["last_timestamp"] = stamp
+        if incomplete:
+            self.persistent_incomplete.add(code)
+
+    def _remember_name(self, guid: str | None, name: str | None, timestamp: datetime) -> None:
+        if not guid:
+            return
+        if guid in self.actor_names:
+            self.actor_names.pop(guid)
+        elif len(self.actor_names) >= MAX_ACTOR_NAMES:
+            self.actor_names.popitem(last=False)
+            self._warn("actor_names_evicted", MAX_ACTOR_NAMES, timestamp)
+        self.actor_names[guid] = (name, timestamp)
+
+    def _expire(self, timestamp: datetime) -> None:
+        name_limit = timestamp - timedelta(seconds=ACTOR_NAME_TTL_SECONDS)
+        while self.actor_names:
+            _, (_, seen) = next(iter(self.actor_names.items()))
+            if seen >= name_limit:
+                break
+            self.actor_names.popitem(last=False)
+        hostile_limit = timestamp - timedelta(seconds=HOSTILE_TTL_SECONDS)
+        while self.hostiles:
+            guid, seen = next(iter(self.hostiles.items()))
+            if seen >= hostile_limit:
+                break
+            self.hostiles.popitem(last=False)
+            self._retire_actor(guid)
+
+    def _retire_actor(self, guid: str) -> None:
+        """Release state owned by a retired destination without losing its DoTs."""
+        for key in [item for item in self.active_auras if item[0] == guid]:
+            self.active_auras.pop(key, None)
+
+    def _identity(self, guid: str | None, timestamp: datetime) -> None:
+        if not guid or guid in self.player_identities:
+            return
+        if len(self.player_identities) >= MAX_PLAYER_IDENTITIES:
+            self.player_identity_truncated = True
+            self._warn("player_identities_truncated", MAX_PLAYER_IDENTITIES, timestamp)
+            return
+        self.player_identities.add(guid)
+
+    def _player(self, guid: str | None, name: str | None,
+                timestamp: datetime) -> dict | None:
+        if not guid:
+            return None
+        self._identity(guid, timestamp)
+        player = self.players.get(guid)
+        if player is not None:
+            if name and not player.get("name"):
+                player["name"] = name
+            return player
+        if len(self.players) >= MAX_PLAYER_AGGREGATES:
+            self._warn("player_aggregates_truncated", MAX_PLAYER_AGGREGATES, timestamp)
+            return None
+        player = _new_player(guid, name)
+        self.players[guid] = player
+        return player
+
+    def _mark_hostile(self, guid: str | None, timestamp: datetime) -> None:
+        if not guid or _is_player(guid):
+            return
+        if guid in self.hostiles:
+            self.hostiles.pop(guid)
+            self.hostiles[guid] = timestamp
+            return
+        elif len(self.hostiles) >= MAX_RELEVANT_HOSTILES:
+            evicted, _ = self.hostiles.popitem(last=False)
+            self._retire_actor(evicted)
+            self._warn("hostiles_capacity_evicted", MAX_RELEVANT_HOSTILES,
+                       timestamp, incomplete=True)
+        self.hostiles[guid] = timestamp
+        for record in self.history:
+            # Causal look-back promotes this actor's own prior casts/auras. Merely
+            # targeting a now-known hostile does not make an unrelated NPC relevant.
+            if record.parsed.source_guid == guid:
+                self._select_record(record)
+
+    def _remember_pet(self, pet: str | None, owner: str | None,
+                      timestamp: datetime) -> None:
+        if not pet or not owner:
+            return
+        if pet in self.pet_owners:
+            self.pet_owners.pop(pet)
+        elif len(self.pet_owners) >= MAX_PET_OWNERS:
+            evicted, _ = self.pet_owners.popitem(last=False)
+            self._retire_actor(evicted)
+            self._warn("pet_owners_capacity_evicted", MAX_PET_OWNERS,
+                       timestamp, incomplete=True)
+        self.pet_owners[pet] = owner
+        player = self.players.get(owner)
+        if player is not None and pet not in player["pets"]:
+            player["pets"].append(pet)
+
+    def _relevant(self, guid: str | None, flags: int = 0) -> bool:
+        return bool(_is_player(guid, flags) or guid in self.pet_owners or guid in self.hostiles)
+
+    def _add_spell_key(self, kind: str, spell_id: int | None,
+                       timestamp: datetime) -> bool:
+        key = (kind, spell_id)
+        if key in self.spell_keys:
+            return True
+        if len(self.spell_keys) >= MAX_SPELL_AGGREGATES:
+            self._warn("spell_aggregates_truncated", MAX_SPELL_AGGREGATES, timestamp)
+            return False
+        self.spell_keys.add(key)
+        return True
+
+    def _aggregate(self, parsed: ParsedCombatEvent, timestamp: datetime) -> None:
+        source_guid = self.pet_owners.get(parsed.source_guid or "", parsed.source_guid)
+        destination_guid = self.pet_owners.get(parsed.destination_guid or "",
+                                               parsed.destination_guid)
+        source = self.players.get(source_guid or "")
+        destination = self.players.get(destination_guid or "")
+        amount = max(0, parsed.amount or 0)
+        spell_admitted = parsed.spell_id is None or \
+            self._add_spell_key(parsed.event, parsed.spell_id, timestamp)
+        if parsed.event in DAMAGE_EVENTS:
+            if source is not None:
+                source["damage_done"] += amount
+            if destination is not None:
+                destination["damage_taken"] += amount
+        elif parsed.event in HEAL_EVENTS:
+            effective = max(0, amount - max(0, parsed.overheal or 0))
+            if source is not None:
+                source["healing_done"] += effective
+            if destination is not None:
+                destination["healing_received"] += effective
+            if source is not None and source_guid == destination_guid:
+                source["self_healing"] += effective
+        elif parsed.event == "SPELL_ABSORBED":
+            if destination is not None:
+                destination["absorbs_received"] += amount
+        elif parsed.event == "SPELL_INTERRUPT":
+            self.total_interrupts += 1
+            if source is not None:
+                source["interrupts"] += 1
+            detail = parsed.as_dict(timestamp, b"")
+            detail.pop("raw", None)
+            if len(self.interrupts) < MAX_INTERRUPT_DETAILS:
+                self.interrupts.append(detail)
+            else:
+                self._warn("interrupt_details_truncated", MAX_INTERRUPT_DETAILS, timestamp)
+        elif parsed.event in DISPEL_EVENTS:
+            self.total_dispels += 1
+            if source is not None:
+                source["dispels"] += 1
+            detail = parsed.as_dict(timestamp, b"")
+            detail.pop("raw", None)
+            if len(self.dispels) < MAX_DISPEL_DETAILS:
+                self.dispels.append(detail)
+            else:
+                self._warn("dispel_details_truncated", MAX_DISPEL_DETAILS, timestamp)
+        if parsed.event == "SPELL_CAST_SUCCESS" and parsed.source_guid in self.hostiles and \
+                spell_admitted:
+            key = str(parsed.spell_id) if parsed.spell_id is not None else \
+                (parsed.spell_name or "unknown")
+            self.enemy_cast_successes[key] = self.enemy_cast_successes.get(key, 0) + 1
+
+    def _select_record(self, record: _AnalysisRecord) -> None:
+        record.selected = True
+        if record.aggregated:
+            return
+        record.aggregated = True
+        event = record.parsed.event
+        self.event_counts[event] = self.event_counts.get(event, 0) + 1
+        self._aggregate(record.parsed, record.timestamp)
+
+    def _auras(self, parsed: ParsedCombatEvent, timestamp: datetime) -> None:
+        key = (parsed.destination_guid or "", parsed.spell_id, parsed.source_guid)
+        if parsed.event in AURA_APPLY_EVENTS:
+            if not self._relevant(parsed.destination_guid, parsed.destination_flags):
+                return
+            if key not in self.active_auras and len(self.active_auras) >= MAX_ACTIVE_AURAS:
+                self._warn("active_auras_truncated", MAX_ACTIVE_AURAS,
+                           timestamp, incomplete=True)
+                return
+            self.active_auras[key] = {
+                "destination_guid": parsed.destination_guid,
+                "source_guid": parsed.source_guid, "spell_id": parsed.spell_id,
+                "spell_name": parsed.spell_name, "aura_type": parsed.aura_type,
+                "applied_at": format_timestamp(timestamp),
+            }
+        elif parsed.event in AURA_REMOVE_EVENTS:
+            for aura_key in [item for item in self.active_auras
+                             if item[0] == parsed.destination_guid and
+                             item[1] == parsed.spell_id]:
+                self.active_auras.pop(aura_key, None)
+        elif parsed.event in {"UNIT_DIED", "UNIT_DESTROYED"}:
+            destination = parsed.destination_guid
+            for aura_key in [item for item in self.active_auras if item[0] == destination]:
+                self.active_auras.pop(aura_key, None)
+
+    def _write_death(self, record: _AnalysisRecord) -> None:
+        parsed, timestamp = record.parsed, record.timestamp
+        player = self.players.get(parsed.destination_guid or "")
+        if player is not None:
+            player["deaths"] += 1
+        self.total_player_deaths += 1
+        aura_cutoff = timestamp - timedelta(seconds=CAUSAL_SECONDS)
+        base_cutoff = timestamp - timedelta(seconds=DEATH_WINDOW_SECONDS)
+        active_keys = {(key[1], key[2]) for key in self.active_auras
+                       if key[0] == parsed.destination_guid}
+        has_early_aura = any(
+            aura_cutoff <= item.timestamp < base_cutoff and
+            item.parsed.event in AURA_APPLY_EVENTS and
+            item.parsed.destination_guid == parsed.destination_guid and
+            (item.parsed.spell_id, item.parsed.source_guid) in active_keys
+            for item in self.history)
+        window_seconds = CAUSAL_SECONDS if has_early_aura else DEATH_WINDOW_SECONDS
+        cutoff = timestamp - timedelta(seconds=window_seconds)
+        player_guid = parsed.destination_guid
+
+        def death_relevant(item: _AnalysisRecord) -> bool:
+            candidate = item.parsed
+            if candidate.destination_guid == player_guid:
+                return True
+            if candidate.event in STRUCTURAL_EVENTS | ALWAYS_KEEP_ACTOR_EVENTS:
+                return True
+            if candidate.source_guid == player_guid and candidate.event in \
+                    (CAST_EVENTS | {"SPELL_INTERRUPT", "SPELL_DISPEL",
+                                    "SPELL_DISPEL_FAILED", "SPELL_STOLEN"}):
+                return True
+            if candidate.event in CAST_EVENTS | {"SPELL_INTERRUPT", "SPELL_DISPEL",
+                                                  "SPELL_DISPEL_FAILED", "SPELL_STOLEN"}:
+                return item.selected
+            if candidate.source_guid in self.hostiles and candidate.event in \
+                    (AURA_APPLY_EVENTS | AURA_REMOVE_EVENTS | SUMMON_EVENTS):
+                return item.selected
+            return False
+
+        events = [item.parsed.as_dict(item.timestamp, item.raw, timestamp)
+                  for item in self.history if item.timestamp >= cutoff and
+                  death_relevant(item)]
+        involved = []
+        for item in self.history:
+            if item.timestamp >= cutoff:
+                for guid in (item.parsed.source_guid, item.parsed.destination_guid):
+                    if guid in self.hostiles and guid not in involved:
+                        involved.append(guid)
+        active = [dict(value) for key, value in self.active_auras.items()
+                  if key[0] == parsed.destination_guid]
+        reasons = set(self.persistent_incomplete)
+        for first, last in self.dropped_intervals:
+            if first <= timestamp and last >= cutoff:
+                reasons.add("causal_history_dropped")
+        death = {"timestamp": format_timestamp(timestamp),
+                 "player_guid": parsed.destination_guid,
+                 "player": parsed.destination_name,
+                 "window_seconds": window_seconds,
+                 "hostiles": involved, "active_auras": active, "events": events,
+                 "raw": record.raw.decode("utf-8", errors="replace").rstrip("\r\n")}
+        if self.current_encounter is not None:
+            death["encounter"] = dict(self.current_encounter)
+        if reasons:
+            death["analysis_incomplete"] = True
+            death["incomplete_reasons"] = sorted(reasons)
+        self._deaths.write(json.dumps(death, ensure_ascii=False,
+                                      separators=(",", ":")).encode("utf-8") + b"\n")
+
+    def _flush_record(self, record: _AnalysisRecord) -> None:
+        if record.selected:
+            self._combat.write(record.raw)
+            self.combat_lines += 1
+            self.combat_bytes += len(record.raw)
+
+    def _trim_history(self, now: datetime) -> None:
+        cutoff = now - timedelta(seconds=CAUSAL_SECONDS)
+        while self.dropped_intervals and self.dropped_intervals[0][1] < cutoff:
+            self.dropped_intervals.popleft()
+        while self.history and self.history[0].timestamp < cutoff:
+            record = self.history.popleft()
+            self.history_bytes -= len(record.raw)
+            self._flush_record(record)
+        while self.history and (len(self.history) > MAX_CAUSAL_LINES or
+                                self.history_bytes > MAX_CAUSAL_BYTES):
+            first = self.history.popleft()
+            self.history_bytes -= len(first.raw)
+            self._flush_record(first)
+            self._warn("causal_history_dropped",
+                       MAX_CAUSAL_LINES if len(self.history) >= MAX_CAUSAL_LINES
+                       else MAX_CAUSAL_BYTES, first.timestamp)
+            if self.dropped_intervals and self.dropped_intervals[-1][1] >= \
+                    first.timestamp - timedelta(microseconds=1):
+                self.dropped_intervals[-1] = (self.dropped_intervals[-1][0], first.timestamp)
+            elif self.dropped_intervals and len(self.dropped_intervals) >= \
+                    max(1, MAX_CAUSAL_LINES):
+                previous = self.dropped_intervals.pop()
+                self.dropped_intervals.append((previous[0], first.timestamp))
+            else:
+                self.dropped_intervals.append((first.timestamp, first.timestamp))
+
+    def consume(self, raw: bytes, timestamp: datetime | None,
+                event: str | None, args: list[str]) -> None:
+        if timestamp is None:
+            return
+        if event is None:
+            parsed = ParsedCombatEvent(event="UNPARSEABLE", parse_fallback=True)
+            self.parse_fallbacks["UNPARSEABLE"] = \
+                self.parse_fallbacks.get("UNPARSEABLE", 0) + 1
+            self._warn("parse_fallback", 0, timestamp)
+            self.history.append(_AnalysisRecord(timestamp, raw, parsed, True))
+            self.history_bytes += len(raw)
+            self._trim_history(timestamp)
+            return
+        self._expire(timestamp)
+        if event == "ENCOUNTER_START":
+            self.current_encounter = {
+                "type": self.kind,
+                "encounter_id": to_int(arg_at(args, 0)),
+                "boss": unquote(arg_at(args, 1)) or None,
+            }
+        parsed = parse_combat_event(event, args)
+        if parsed.parse_fallback:
+            self.parse_fallbacks[event] = self.parse_fallbacks.get(event, 0) + 1
+            self._warn("parse_fallback", 0, timestamp)
+        self._remember_name(parsed.source_guid, parsed.source_name, timestamp)
+        self._remember_name(parsed.destination_guid, parsed.destination_name, timestamp)
+        if parsed.source_is_player:
+            self._player(parsed.source_guid, parsed.source_name, timestamp)
+        if parsed.destination_is_player:
+            self._player(parsed.destination_guid, parsed.destination_name, timestamp)
+        if parsed.target_owner_guid and _is_player(parsed.target_owner_guid) and \
+                _is_pet(parsed.destination_flags):
+            self._player(parsed.target_owner_guid, None, timestamp)
+            self._remember_pet(parsed.destination_guid, parsed.target_owner_guid, timestamp)
+        if event == "COMBATANT_INFO" and parsed.source_guid:
+            player = self._player(parsed.source_guid, None, timestamp)
+            if player is not None:
+                player["spec_id"] = parsed.spell_id
+                player["role"] = SPEC_ROLES.get(parsed.spell_id)
+        direct_player = parsed.source_is_player or parsed.destination_is_player
+        if direct_player:
+            other_guid = (parsed.destination_guid if parsed.source_is_player
+                          else parsed.source_guid)
+            other_flags = (parsed.destination_flags if parsed.source_is_player
+                           else parsed.source_flags)
+            if other_guid and not _is_player(other_guid, other_flags) and (other_flags & REACTION_HOSTILE):
+                # An interaction proves relevance, but not ownership: hostile pets
+                # frequently attack players. Only summon/create establishes owner.
+                self._mark_hostile(other_guid, timestamp)
+        if event in SUMMON_EVENTS and self._relevant(parsed.source_guid, parsed.source_flags):
+            owner = self.pet_owners.get(parsed.source_guid or "", parsed.source_guid)
+            self._remember_pet(parsed.destination_guid, owner, timestamp)
+        source_relevant = self._relevant(parsed.source_guid, parsed.source_flags)
+        pet_only_heal = event in HEAL_EVENTS and not direct_player and \
+            (_is_pet(parsed.source_flags) or parsed.source_guid in self.pet_owners) and \
+            (_is_pet(parsed.destination_flags) or parsed.destination_guid in self.pet_owners)
+        selected = (event in STRUCTURAL_EVENTS or event in ALWAYS_KEEP_ACTOR_EVENTS or
+                    parsed.parse_fallback or direct_player or
+                    (source_relevant and not pet_only_heal))
+        for guid in (parsed.source_guid, parsed.destination_guid):
+            if guid in self.hostiles:
+                self.hostiles.pop(guid)
+                self.hostiles[guid] = timestamp
+        record = _AnalysisRecord(timestamp, raw, parsed)
+        self.history.append(record)
+        self.history_bytes += len(raw)
+        if selected:
+            self._select_record(record)
+        self._trim_history(timestamp)
+        if event == "UNIT_DIED" and parsed.destination_is_player:
+            self._write_death(record)
+        self._auras(parsed, timestamp)
+        if event == "ENCOUNTER_END" and self.current_encounter is not None:
+            encounter_id = to_int(arg_at(args, 0))
+            if encounter_id is None or encounter_id == self.current_encounter.get("encounter_id"):
+                self.current_encounter = None
+
+    def close_streams(self) -> None:
+        while self.history:
+            self._flush_record(self.history.popleft())
+        self.history_bytes = 0
+        for handle in (self._combat, self._deaths):
+            if not handle.closed:
+                handle.flush()
+                os.fsync(handle.fileno())
+                handle.close()
+
+    def deaths(self) -> list[dict]:
+        result = []
+        try:
+            with open(self.deaths_spool_path, "rb") as handle:
+                for raw in handle:
+                    if raw.strip():
+                        result.append(json.loads(raw))
+        except FileNotFoundError:
+            pass
+        return result
+
+    @staticmethod
+    def _encounter_for(segment_metadata: dict) -> dict | None:
+        if segment_metadata.get("type") == KIND_RAID:
+            return {"type": KIND_RAID,
+                    "encounter_id": segment_metadata.get("encounter_id"),
+                    "boss": segment_metadata.get("boss"),
+                    "difficulty_id": segment_metadata.get("difficulty_id")}
+        if segment_metadata.get("type") == KIND_MPLUS:
+            return {"type": KIND_MPLUS,
+                    "dungeon": segment_metadata.get("dungeon"),
+                    "map_id": segment_metadata.get("map_id"),
+                    "key_level": segment_metadata.get("key_level")}
+        return None
+
+    def write_deaths_json(self, path: str, segment_metadata: dict) -> None:
+        """Assemble the JSON array from the bounded-memory JSONL spool."""
+        encounter = self._encounter_for(segment_metadata)
+        with open(path, "wb") as target:
+            target.write(b"[\n")
+            first = True
+            try:
+                with open(self.deaths_spool_path, "rb") as source:
+                    for raw in source:
+                        if not raw.strip():
+                            continue
+                        death = json.loads(raw)
+                        if encounter is not None:
+                            merged_encounter = dict(encounter)
+                            merged_encounter.update(death.get("encounter") or {})
+                            death["encounter"] = merged_encounter
+                        if not first:
+                            target.write(b",\n")
+                        target.write(json.dumps(death, ensure_ascii=False,
+                                                separators=(",", ":")).encode("utf-8"))
+                        first = False
+            except FileNotFoundError:
+                pass
+            target.write(b"\n]\n")
+            target.flush()
+            os.fsync(target.fileno())
+
+    def summary_and_players(self, segment_metadata: dict) -> tuple[dict, list[dict]]:
+        summary = dict(segment_metadata)
+        summary.update({
+            "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+            "player_count": len(self.player_identities),
+            "player_count_truncated": self.player_identity_truncated,
+            "player_deaths": self.total_player_deaths,
+            "combat_lines": self.combat_lines,
+            "event_counts": dict(sorted(self.event_counts.items())),
+            "enemy_cast_successes": dict(sorted(self.enemy_cast_successes.items())),
+            "interrupts": self.interrupts,
+            "interrupt_count": self.total_interrupts,
+            "dispels": self.dispels,
+            "dispel_count": self.total_dispels,
+            "parse_fallbacks": dict(sorted(self.parse_fallbacks.items())),
+            "warnings": list(self.warnings.values()),
+        })
+        players = sorted((dict(value) for value in self.players.values()),
+                         key=lambda value: value["guid"])
+        return summary, players
+
+    def result(self, segment_metadata: dict) -> tuple[dict, list[dict], list[dict]]:
+        summary, players = self.summary_and_players(segment_metadata)
+        deaths = self.deaths()
+        encounter = self._encounter_for(segment_metadata)
+        if encounter is not None:
+            for death in deaths:
+                merged_encounter = dict(encounter)
+                merged_encounter.update(death.get("encounter") or {})
+                death["encounter"] = merged_encounter
+        return summary, players, deaths
 
 
 # --- segments ---------------------------------------------------------------------
@@ -253,14 +1213,19 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
 class Segment:
     """One in-progress extraction (a M+ run or a raid pull)."""
 
-    def __init__(self, kind: str, start_ts: datetime, source_file: str, segment_id: str):
+    def __init__(self, kind: str, start_ts: datetime, source_file: str, segment_id: str,
+                 output_options: OutputOptions | None = None):
         self.kind = kind
         self.start_ts = start_ts
         self.source_file = source_file
         self.segment_id = segment_id
+        self.output_options = output_options or OutputOptions()
         self.partial_path: str | None = None
+        self.stage_dir: str | None = None
+        self.analysis_session: AnalysisSession | None = None
         self.start_offset = 0
         self.lines = 0
+        self.raw_bytes = 0
         self.end_ts: datetime | None = None
         self.duration_ms: int | None = None
         # mythic+
@@ -283,19 +1248,33 @@ class Segment:
     def complete(self) -> bool:
         return self.end_ts is not None
 
-    def begin_body(self, partial_path: str) -> None:
+    def begin_body(self, partial_path: str | None, stage_dir: str | None = None) -> None:
         """Open the .partial body file. Called once the START args are parsed."""
         self.partial_path = partial_path
-        self._handle = open(partial_path, "wb")
+        self.stage_dir = stage_dir
+        if partial_path is not None:
+            self._handle = open(partial_path, "wb")
+        if self.output_options.wants_analysis:
+            if stage_dir is None:
+                raise RuntimeError("analysis staging directory was not created")
+            self.analysis_session = AnalysisSession(stage_dir, self.kind)
 
-    def write(self, raw: bytes) -> None:
-        self._handle.write(raw)
+    def write(self, raw: bytes, timestamp: datetime | None = None,
+              event: str | None = None, args: list[str] | None = None) -> None:
+        if self._handle is not None:
+            self._handle.write(raw)
+        if self.analysis_session is not None:
+            self.analysis_session.consume(raw, timestamp, event, args or [])
         self.lines += 1
+        self.raw_bytes += len(raw)
 
     def close(self) -> None:
         if self._handle is not None and not self._handle.closed:
             self._handle.flush()
+            os.fsync(self._handle.fileno())
             self._handle.close()
+        if self.analysis_session is not None:
+            self.analysis_session.close_streams()
 
     def abandon(self) -> None:
         self.close()
@@ -304,6 +1283,8 @@ class Segment:
                 os.remove(self.partial_path)
             except OSError:
                 pass
+        if self.stage_dir:
+            shutil.rmtree(self.stage_dir, ignore_errors=True)
 
     def display_name(self) -> str:
         if self.kind == KIND_MPLUS:
@@ -371,15 +1352,16 @@ class Segment:
 class SegmentPublisher:
     """Owns the output tree and the recoverable publication protocol."""
 
-    def __init__(self, output_dir: str, verbose: bool = True):
+    def __init__(self, output_dir: str, verbose: bool = True,
+                 output_options: OutputOptions | None = None):
         self.output_dir = os.path.abspath(output_dir)
         self.mplus_dir = os.path.join(self.output_dir, MPLUS_DIR_NAME)
         self.raids_dir = os.path.join(self.output_dir, RAID_DIR_NAME)
         self.verbose = verbose
+        self.options = output_options or OutputOptions()
 
     def ensure_dirs(self) -> None:
-        for path in (self.output_dir, self.mplus_dir, self.raids_dir):
-            os.makedirs(path, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
 
     def directory_for(self, kind: str) -> str:
         return self.mplus_dir if kind == KIND_MPLUS else self.raids_dir
@@ -393,6 +1375,30 @@ class SegmentPublisher:
             except OSError:
                 continue
             for entry in entries:
+                if entry == ".staging":
+                    staging = os.path.join(directory, entry)
+                    try:
+                        for child in os.listdir(staging):
+                            shutil.rmtree(os.path.join(staging, child))
+                            removed += 1
+                    except OSError:
+                        pass
+                    continue
+                candidate_tree = os.path.join(directory, entry)
+                analysis_tree = os.path.join(candidate_tree, "analysis")
+                if os.path.isdir(analysis_tree):
+                    try:
+                        for child in os.listdir(analysis_tree):
+                            if child.endswith(".tmp"):
+                                os.remove(os.path.join(analysis_tree, child))
+                                removed += 1
+                        if not os.listdir(analysis_tree):
+                            os.rmdir(analysis_tree)
+                            os.rmdir(candidate_tree)
+                            removed += 1
+                            continue
+                    except OSError:
+                        pass
                 if entry.endswith(".partial") or entry.endswith(".tmp"):
                     try:
                         os.remove(os.path.join(directory, entry))
@@ -404,9 +1410,19 @@ class SegmentPublisher:
     def partial_path(self, kind: str, core_name: str, segment_id: str) -> str:
         # The hash keeps two simultaneously open segments (different log files, watch
         # mode) from sharing a partial file.
+        if not self.options.wants_full:
+            return ""
+        if not self.options.is_legacy_default:
+            return os.path.join(self.stage_dir(kind, segment_id), "full.raw")
         suffix = _sha1(segment_id.encode("utf-8"))[:8]
         return os.path.join(self.directory_for(kind),
                             "%s.%s.txt.partial" % (core_name, suffix))
+
+    def stage_dir(self, kind: str, segment_id: str) -> str:
+        path = os.path.join(self.directory_for(kind), ".staging",
+                            _sha1(segment_id.encode("utf-8")))
+        os.makedirs(path, exist_ok=True)
+        return path
 
     def _existing_segment_id(self, json_path: str) -> str | None:
         try:
@@ -422,21 +1438,38 @@ class SegmentPublisher:
         for index in range(2, 1000):
             yield "%s-%d" % (with_seconds, index)
 
+    def _name_segment_id(self, directory: str, name: str) -> str | None:
+        root_id = self._existing_segment_id(os.path.join(directory, name + ".json"))
+        if root_id:
+            return root_id
+        marker = os.path.join(directory, name, "analysis", "metadata.json")
+        marker_id = self._existing_segment_id(marker)
+        if marker_id or os.path.exists(marker):
+            return marker_id
+        # Before the global marker exists, summary is the recovery identity for a
+        # partially published analysis-only attempt. An unreadable marker is never
+        # bypassed through this fallback, so unknown existing data is not purged.
+        return self._existing_segment_id(
+            os.path.join(directory, name, "analysis", "summary.json"))
+
     def resolve_name(self, segment: Segment) -> str:
         directory = self.directory_for(segment.kind)
         for candidate in self._candidate_names(segment):
             txt_path = os.path.join(directory, candidate + ".txt")
+            gzip_path = txt_path + ".gz"
             json_path = os.path.join(directory, candidate + ".json")
-            has_txt = os.path.exists(txt_path)
+            analysis_path = os.path.join(directory, candidate)
+            zip_path = os.path.join(directory, candidate + "_analysis.zip")
+            has_txt = os.path.exists(txt_path) or os.path.exists(gzip_path)
             has_json = os.path.exists(json_path)
-            if not has_txt and not has_json:
+            has_analysis = os.path.exists(analysis_path) or os.path.exists(zip_path)
+            if not has_txt and not has_json and not has_analysis:
                 return candidate
-            if has_json:
-                existing = self._existing_segment_id(json_path)
-                if existing == segment.segment_id:
-                    return candidate  # same entity, idempotent rewrite
-                if not has_txt:
-                    return candidate  # json without txt = reclaimable crash orphan
+            existing = self._name_segment_id(directory, candidate)
+            if existing == segment.segment_id:
+                return candidate  # same entity, idempotent/profile extension
+            if has_json and not has_txt and not has_analysis:
+                return candidate  # root json without body = reclaimable crash orphan
             # otherwise occupied by a different segment: try the next candidate
         raise RuntimeError("could not find a free output name for " + segment.segment_id)
 
@@ -451,35 +1484,203 @@ class SegmentPublisher:
             entries = os.listdir(directory)
         except OSError:
             return
+        names = set()
         for entry in entries:
-            if not entry.endswith(".json"):
-                continue
-            name = entry[:-5]
+            if entry.endswith(".json"):
+                names.add(entry[:-5])
+            elif os.path.isdir(os.path.join(directory, entry)) and entry != ".staging":
+                names.add(entry)
+        for name in sorted(names):
             if name == keep_name:
                 continue
-            if self._existing_segment_id(os.path.join(directory, entry)) != segment_id:
+            if self._name_segment_id(directory, name) != segment_id:
                 continue
-            for stale in (name + ".txt", entry):
+            stale_files = []
+            if self.options.wants_full:
+                stale_files.extend((name + ".txt", name + ".txt.gz", name + ".json"))
+            if self.options.wants_analysis:
+                stale_files.append(name + "_analysis.zip")
+            for stale in stale_files:
                 try:
                     os.remove(os.path.join(directory, stale))
                 except FileNotFoundError:
                     pass
+            analysis_tree = os.path.join(directory, name)
+            if self.options.wants_analysis and os.path.isdir(analysis_tree):
+                shutil.rmtree(analysis_tree)
+
+    @staticmethod
+    def _write_stage(path: str, data: bytes) -> None:
+        with open(path, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _deterministic_zip(path: str, files: list[tuple[str, str | bytes]]) -> None:
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED,
+                             compresslevel=9) as archive:
+            for arcname, source in sorted(files):
+                info = zipfile.ZipInfo(arcname, (1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o100644 << 16
+                if isinstance(source, bytes):
+                    archive.writestr(info, source, compress_type=zipfile.ZIP_DEFLATED,
+                                     compresslevel=9)
+                else:
+                    with open(source, "rb") as origin, archive.open(
+                            info, "w", force_zip64=True) as target:
+                        shutil.copyfileobj(origin, target, READ_BLOCK)
+        with open(path, "ab") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _analysis_payload(self, segment: Segment, name: str,
+                          full_stored_bytes: int | None) -> tuple[dict, dict[str, str]]:
+        session = segment.analysis_session
+        stage_dir = segment.stage_dir
+        if session is None or stage_dir is None:
+            raise RuntimeError("analysis session missing at publication")
+        segment_metadata = segment.metadata()
+        summary, players = session.summary_and_players(segment_metadata)
+        paths = {
+            "summary.json": os.path.join(stage_dir, "summary.json"),
+            "players.json": os.path.join(stage_dir, "players.json"),
+            "deaths.json": os.path.join(stage_dir, "deaths.json"),
+        }
+        for filename, value in (("summary.json", summary), ("players.json", players)):
+            self._write_stage(paths[filename], _json_bytes(value))
+        session.write_deaths_json(paths["deaths.json"], segment_metadata)
+        combat_name = "combat.txt.gz" if self.options.gzip else "combat.txt"
+        combat_path = os.path.join(stage_dir, combat_name)
+        if self.options.gzip:
+            _deterministic_gzip(session.combat_raw_path, combat_path)
+        else:
+            shutil.copyfile(session.combat_raw_path, combat_path)
+        paths[combat_name] = combat_path
+        combat_stored = os.path.getsize(combat_path)
+        bundle_bytes = combat_stored + sum(os.path.getsize(paths[item]) for item in
+                                           ("summary.json", "deaths.json", "players.json"))
+        reduction = None
+        if segment.raw_bytes:
+            reduction = round(100.0 * (segment.raw_bytes - session.combat_bytes) /
+                              segment.raw_bytes, 2)
+        artifacts = ([name + ".json",
+                      name + (".txt.gz" if self.options.gzip else ".txt")]
+                     if self.options.wants_full else [])
+        artifacts.extend([os.path.join(name, "analysis", item).replace("\\", "/")
+                          for item in sorted(paths)])
+        artifacts.append(os.path.join(name, "analysis", "metadata.json").replace("\\", "/"))
+        if self.options.bundle:
+            artifacts.append(name + "_analysis.zip")
+        metadata = {
+            "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+            "segment_id": segment.segment_id,
+            "profile": self.options.profile,
+            "options": self.options.as_dict(),
+            "artifacts": artifacts,
+            "warnings": list(session.warnings.values()),
+            "full_uncompressed_bytes": segment.raw_bytes,
+            "full_stored_bytes": full_stored_bytes,
+            "combat_uncompressed_bytes": session.combat_bytes,
+            "combat_stored_bytes": combat_stored,
+            "analysis_bundle_bytes": bundle_bytes,
+            "analysis_zip_bytes": None,
+            "reduction_percent": reduction,
+        }
+        return metadata, paths
 
     def publish(self, segment: Segment) -> tuple[str, str]:
-        """Publish order: json first, then rename the body. Returns (kind, txt path)."""
+        """Publish requested artifacts, with analysis metadata as the final marker."""
         segment.close()
         self.ensure_dirs()
         directory = self.directory_for(segment.kind)
         name = self.resolve_name(segment)
         json_path = os.path.join(directory, name + ".json")
-        txt_path = os.path.join(directory, name + ".txt")
-        payload = json.dumps(segment.metadata(), ensure_ascii=False, indent=2)
-        _atomic_write_bytes(json_path, payload.encode("utf-8"))
-        os.replace(segment.partial_path, txt_path)
-        self._purge_stale(directory, segment.segment_id, name)
-        if self.verbose:
-            safe_print("  + %s" % os.path.join(os.path.basename(directory), name + ".txt"))
-        return segment.kind, txt_path
+        body_suffix = ".txt.gz" if self.options.gzip else ".txt"
+        body_path = os.path.join(directory, name + body_suffix)
+        stage_dir = segment.stage_dir
+        full_stage = segment.partial_path
+        try:
+            if self.options.wants_full:
+                if full_stage is None:
+                    raise RuntimeError("full body staging file missing")
+                if self.options.gzip:
+                    if stage_dir is None:
+                        raise RuntimeError("gzip staging directory missing")
+                    compressed = os.path.join(stage_dir, "full.txt.gz")
+                    _deterministic_gzip(full_stage, compressed)
+                    full_stage = compressed
+                full_stored_bytes = os.path.getsize(full_stage)
+            else:
+                full_stored_bytes = None
+
+            analysis_metadata = None
+            analysis_paths: dict[str, str] = {}
+            if self.options.wants_analysis:
+                analysis_metadata, analysis_paths = self._analysis_payload(
+                    segment, name, full_stored_bytes)
+
+            # Legacy invariant: metadata is visible before its requested body.
+            if self.options.wants_full:
+                _atomic_write_bytes(json_path, _json_bytes(segment.metadata()))
+                if self.options.is_legacy_default:
+                    os.replace(segment.partial_path, body_path)
+                else:
+                    _copy_atomic(full_stage, body_path)
+
+            marker_path = body_path
+            if analysis_metadata is not None:
+                analysis_dir = os.path.join(directory, name, "analysis")
+                os.makedirs(analysis_dir, exist_ok=True)
+                combat_names = [item for item in analysis_paths if item.startswith("combat.")]
+                publish_order = ["summary.json"] + combat_names + \
+                    ["deaths.json", "players.json"]
+                for filename in publish_order:
+                    _copy_atomic(analysis_paths[filename], os.path.join(analysis_dir, filename))
+                embedded = dict(analysis_metadata)
+                embedded_bytes = _json_bytes(embedded)
+                if self.options.bundle:
+                    zip_stage = os.path.join(stage_dir or "", "analysis.zip")
+                    zip_files: list[tuple[str, str | bytes]] = [
+                        (filename, source) for filename, source in analysis_paths.items()]
+                    zip_files.append(("metadata.json", embedded_bytes))
+                    self._deterministic_zip(zip_stage, zip_files)
+                    zip_path = os.path.join(directory, name + "_analysis.zip")
+                    _copy_atomic(zip_stage, zip_path)
+                    analysis_metadata["analysis_zip_bytes"] = os.path.getsize(zip_path)
+                marker_path = os.path.join(analysis_dir, "metadata.json")
+                _atomic_write_bytes(marker_path, _json_bytes(analysis_metadata))
+                folder_total = sum(os.path.getsize(os.path.join(analysis_dir, item))
+                                   for item in publish_order) + os.path.getsize(marker_path)
+                if self.verbose:
+                    safe_print("    Full log:              %s" % format_megabytes(
+                        analysis_metadata["full_uncompressed_bytes"]))
+                    if analysis_metadata["full_stored_bytes"] is not None and \
+                            analysis_metadata["full_stored_bytes"] != \
+                            analysis_metadata["full_uncompressed_bytes"]:
+                        safe_print("    Full log stored:       %s" % format_megabytes(
+                            analysis_metadata["full_stored_bytes"]))
+                    safe_print("    Analysis log:          %s" % format_megabytes(
+                        analysis_metadata["combat_uncompressed_bytes"]))
+                    safe_print("    Reduction:             %s%%" %
+                               analysis_metadata["reduction_percent"])
+                    safe_print("    Analysis bundle total: %s" % format_megabytes(folder_total))
+                    if analysis_metadata["analysis_zip_bytes"] is not None:
+                        safe_print("    Analysis ZIP:          %s" % format_megabytes(
+                            analysis_metadata["analysis_zip_bytes"]))
+
+            self._purge_stale(directory, segment.segment_id, name)
+            if self.verbose:
+                safe_print("  + %s" % os.path.relpath(marker_path, self.output_dir))
+            return segment.kind, marker_path
+        finally:
+            if stage_dir:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+                try:
+                    os.rmdir(os.path.dirname(stage_dir))
+                except OSError:
+                    pass
 
 
 # --- state machine ----------------------------------------------------------------
@@ -507,7 +1708,7 @@ class SegmentTracker:
             # Unparseable line: still part of the segment body, never fatal.
             self._buffer_line(self.last_ts, offset, raw)
             if self.segment is not None:
-                self.segment.write(raw)
+                self.segment.write(raw, self.last_ts, None, [])
             return
 
         if self.last_ts is not None and \
@@ -537,7 +1738,7 @@ class SegmentTracker:
             if segment is not None and segment.kind == KIND_MPLUS and segment.end_ts is None:
                 # Encounters inside an open M+ never get their own file.
                 self._buffer_line(timestamp, offset, raw)
-                segment.write(raw)
+                segment.write(raw, timestamp, event, args)
                 self._record_boss(args)
                 return
             self._close_segment()
@@ -547,7 +1748,7 @@ class SegmentTracker:
 
         self._buffer_line(timestamp, offset, raw)
         if self.segment is not None:
-            self.segment.write(raw)
+            self.segment.write(raw, timestamp, event, args)
 
         if event == "CHALLENGE_MODE_END":
             self._handle_challenge_end(timestamp, args)
@@ -613,17 +1814,24 @@ class SegmentTracker:
 
     def _start_segment(self, segment: Segment, fallback_offset: int) -> None:
         self.publisher.ensure_dirs()
-        segment.begin_body(self.publisher.partial_path(
-            segment.kind, segment.name_core(False), segment.segment_id))
+        os.makedirs(self.publisher.directory_for(segment.kind), exist_ok=True)
+        stage_dir = None
+        if not self.publisher.options.is_legacy_default:
+            stage_dir = self.publisher.stage_dir(segment.kind, segment.segment_id)
+        partial_path = self.publisher.partial_path(
+            segment.kind, segment.name_core(False), segment.segment_id) or None
+        segment.begin_body(partial_path, stage_dir)
         segment.start_offset = self.buffer[0][1] if self.buffer else fallback_offset
-        for _, _, raw in self.buffer:
-            segment.write(raw)
+        for buffered_ts, _, raw in self.buffer:
+            parsed_ts, event, args = parse_line(_decode(raw), self.default_year)
+            segment.write(raw, parsed_ts or buffered_ts, event, args)
         self.segment = segment
 
     def _open_mplus(self, timestamp: datetime, args: list[str]) -> None:
         map_id = to_int(arg_at(args, 1))
         segment = Segment(KIND_MPLUS, timestamp, self.source_file,
-                          self._segment_id(KIND_MPLUS, timestamp, map_id))
+                          self._segment_id(KIND_MPLUS, timestamp, map_id),
+                          self.publisher.options)
         segment.dungeon = unquote(arg_at(args, 0)) or None
         segment.map_id = map_id
         segment.challenge_mode_id = to_int(arg_at(args, 2))
@@ -634,7 +1842,8 @@ class SegmentTracker:
     def _open_raid(self, timestamp: datetime, args: list[str]) -> None:
         encounter_id = to_int(arg_at(args, 0))
         segment = Segment(KIND_RAID, timestamp, self.source_file,
-                          self._segment_id(KIND_RAID, timestamp, encounter_id))
+                          self._segment_id(KIND_RAID, timestamp, encounter_id),
+                          self.publisher.options)
         segment.encounter_id = encounter_id
         segment.boss = unquote(arg_at(args, 1)) or None
         segment.difficulty_id = to_int(arg_at(args, 2))
@@ -833,8 +2042,9 @@ def _decode(raw: bytes) -> str:
 class StateStore:
     """state.json: committed offset per log file plus replacement detection."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, profile: str = "full"):
         self.path = os.path.abspath(path)
+        self.profile = profile
         self.data: dict = {"version": 1, "files": {}}
 
     def load(self) -> None:
@@ -851,7 +2061,35 @@ class StateStore:
         _atomic_write_bytes(self.path, payload.encode("utf-8"))
 
     def reset(self) -> None:
-        self.data = {"version": 1, "files": {}}
+        self.data = {"version": 2, "files": {}}
+
+    def _migrate_v2(self) -> None:
+        if self.data.get("version") == 2:
+            return
+        migrated = {}
+        for name, old_entry in self.data.get("files", {}).items():
+            if not isinstance(old_entry, dict):
+                continue
+            legacy = dict(old_entry)
+            legacy.pop("profiles", None)
+            entry = dict(legacy)
+            entry["profiles"] = {"full": legacy}
+            migrated[name] = entry
+        self.data = {"version": 2, "files": migrated}
+
+    def _profile_entry(self, path: str) -> dict | None:
+        entry = self.data.get("files", {}).get(os.path.basename(path))
+        if not isinstance(entry, dict):
+            return None
+        if self.data.get("version") == 2:
+            profiles = entry.get("profiles")
+            if not isinstance(profiles, dict):
+                return None
+            value = profiles.get(self.profile)
+            return value if isinstance(value, dict) else None
+        if self.profile == "full":
+            return entry
+        return None
 
     @staticmethod
     def _hashes(path: str, offset: int) -> tuple[str, str]:
@@ -865,8 +2103,8 @@ class StateStore:
         return _sha1(head), _sha1(tail)
 
     def get_offset(self, path: str) -> int:
-        entry = self.data["files"].get(os.path.basename(path))
-        if not isinstance(entry, dict):
+        entry = self._profile_entry(path)
+        if entry is None:
             return 0
         offset = to_int(str(entry.get("offset", 0))) or 0
         if offset <= 0:
@@ -889,13 +2127,29 @@ class StateStore:
             mtime = os.path.getmtime(path)
         except OSError:
             return
-        self.data["files"][os.path.basename(path)] = {
+        profile_entry = {
             "offset": offset,
             "size": size,
             "mtime": mtime,
             "head_hash": head_hash,
             "tail_hash": tail_hash,
         }
+        self._migrate_v2()
+        name = os.path.basename(path)
+        entry = self.data["files"].get(name)
+        if not isinstance(entry, dict):
+            entry = {"profiles": {}}
+        profiles = entry.get("profiles")
+        if not isinstance(profiles, dict):
+            profiles = {}
+        profiles[self.profile] = profile_entry
+        # Replace the entry wholesale so stale v1 fields cannot claim a non-full
+        # profile's offset to an older binary.
+        new_entry: dict = {"profiles": profiles}
+        full = profiles.get("full")
+        if isinstance(full, dict) and (to_int(str(full.get("offset", 0))) or 0) > 0:
+            new_entry.update(full)
+        self.data["files"][name] = new_entry
 
 
 # --- configuration ----------------------------------------------------------------
@@ -1083,20 +2337,26 @@ class Extractor:
     """Ties config paths, state and publication together."""
 
     def __init__(self, log_dir: str, output_dir: str, state_path: str | None = None,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 output_options: OutputOptions | None = None):
         self.log_dir = os.path.abspath(log_dir)
-        self.publisher = SegmentPublisher(output_dir, verbose=verbose)
+        self.output_options = output_options or OutputOptions()
+        self.publisher = SegmentPublisher(output_dir, verbose=verbose,
+                                          output_options=self.output_options)
         self.state = StateStore(state_path or
-                                os.path.join(self.publisher.output_dir, STATE_FILENAME))
+                                os.path.join(self.publisher.output_dir, STATE_FILENAME),
+                                profile=self.output_options.profile)
+        self.output_lock = OutputLock(self.publisher.output_dir)
         self.verbose = verbose
 
     def prepare(self, reset_state: bool = False) -> None:
-        self.publisher.ensure_dirs()
-        self.state.load()
-        if reset_state:
-            self.state.reset()
-            self.state.save()
-        self.publisher.cleanup_partials()
+        with self.output_lock:
+            self.publisher.ensure_dirs()
+            self.state.load()
+            if reset_state:
+                self.state.reset()
+                self.state.save()
+            self.publisher.cleanup_partials()
 
     def list_logs(self) -> list[str]:
         try:
@@ -1126,6 +2386,10 @@ class Extractor:
         return best
 
     def run_once(self) -> tuple[int, int, int]:
+        with self.output_lock:
+            return self._run_once()
+
+    def _run_once(self) -> tuple[int, int, int]:
         paths = self.list_logs()
         latest = self._latest(paths)
         mplus_total = raid_total = errors = 0
@@ -1155,6 +2419,10 @@ class Extractor:
     def watch(self, interval: float = WATCH_INTERVAL,
               max_polls: int | None = None) -> tuple[int, int, int]:
         """max_polls is a test hook: stop after N polls instead of running forever."""
+        with self.output_lock:
+            return self._watch(interval, max_polls)
+
+    def _watch(self, interval: float, max_polls: int | None) -> tuple[int, int, int]:
         workers: dict[str, FileProcessor] = {}
         mplus_total = raid_total = errors = 0
         polls = 0
@@ -1236,6 +2504,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="Extract Mythic+ runs and raid boss pulls from WoW Retail combat logs.")
     parser.add_argument("--watch", action="store_true",
                         help="keep running and process new lines as WoW writes them")
+    analysis_group = parser.add_mutually_exclusive_group()
+    analysis_group.add_argument("--analysis", action="store_true",
+                                help="publish the full log and a compact analysis package")
+    analysis_group.add_argument("--analysis-only", dest="analysis_only",
+                                action="store_true",
+                                help="publish analysis without creating a new full log")
+    parser.add_argument("--gzip", action="store_true",
+                        help="store requested full/combat bodies as deterministic gzip")
+    parser.add_argument("--bundle", action="store_true",
+                        help="also create an analysis-only ZIP (requires an analysis mode)")
     parser.add_argument("--log-dir", dest="log_dir", default=None,
                         help=r"WoW Logs folder (...\World of Warcraft\_retail_\Logs)")
     parser.add_argument("--output", dest="output", default=None,
@@ -1250,17 +2528,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        options = OutputOptions(analysis=args.analysis, analysis_only=args.analysis_only,
+                                gzip=args.gzip, bundle=args.bundle)
+    except ValueError as exc:
+        parser.error(str(exc))
     log_dir, output_dir = resolve_paths(args.log_dir, args.output, args.config,
                                         args.reconfigure)
-    extractor = Extractor(log_dir, output_dir)
-    extractor.prepare(reset_state=args.reset_state)
-    safe_print("Logs:   %s" % log_dir)
-    safe_print("Output: %s" % output_dir)
-    if args.watch:
-        mplus, raid, errors = extractor.watch()
-    else:
-        mplus, raid, errors = extractor.run_once()
+    extractor = Extractor(log_dir, output_dir, output_options=options)
+    with extractor.output_lock:
+        extractor.prepare(reset_state=args.reset_state)
+        safe_print("Logs:   %s" % log_dir)
+        safe_print("Output: %s" % output_dir)
+        if args.watch:
+            mplus, raid, errors = extractor.watch()
+        else:
+            mplus, raid, errors = extractor.run_once()
     safe_print("Processed: %d Mythic+ runs, %d raid pulls, %d errors" % (mplus, raid, errors))
     safe_print("Output: %s" % output_dir)
     return 1 if errors else 0
