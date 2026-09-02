@@ -43,7 +43,7 @@ RAID_DIR_NAME = "Raids"
 STATE_FILENAME = "state.json"
 CONFIG_FILENAME = "config.json"
 LOCK_FILENAME = ".output.lock"
-ANALYSIS_SCHEMA_VERSION = 1
+ANALYSIS_SCHEMA_VERSION = 2
 
 MAX_PLAYER_IDENTITIES = 256
 MAX_PLAYER_AGGREGATES = 80
@@ -330,12 +330,15 @@ class OutputOptions:
     analysis_only: bool = False
     gzip: bool = False
     bundle: bool = False
+    keep_player_damage: bool = False
 
     def __post_init__(self) -> None:
         if self.analysis and self.analysis_only:
             raise ValueError("--analysis and --analysis-only are mutually exclusive")
         if self.bundle and not self.wants_analysis:
             raise ValueError("--bundle requires --analysis or --analysis-only")
+        if self.keep_player_damage and not self.wants_analysis:
+            raise ValueError("--keep-player-damage requires --analysis or --analysis-only")
 
     @property
     def wants_analysis(self) -> bool:
@@ -359,11 +362,14 @@ class OutputOptions:
             parts.append("gzip")
         if self.bundle:
             parts.append("bundle")
+        if self.keep_player_damage:
+            parts.append("keep-player-damage")
         return "+".join(parts)
 
     def as_dict(self) -> dict:
         return {"full": self.wants_full, "analysis": self.wants_analysis,
                 "gzip": self.gzip, "bundle": self.bundle,
+                "keep_player_damage": self.keep_player_damage,
                 "profile": self.profile}
 
 
@@ -445,6 +451,12 @@ CAST_EVENTS = {"SPELL_CAST_START", "SPELL_CAST_SUCCESS", "SPELL_CAST_FAILED",
 DAMAGE_EVENTS = {"SWING_DAMAGE", "RANGE_DAMAGE", "SPELL_DAMAGE",
                  "SPELL_PERIODIC_DAMAGE", "ENVIRONMENTAL_DAMAGE",
                  "DAMAGE_SHIELD", "DAMAGE_SPLIT"}
+# SWING_DAMAGE_LANDED repeats an already-counted swing to report the victim's state.
+# It is parsed like damage but never aggregated: only DAMAGE_EVENTS carry an amount.
+DAMAGE_RESULT_EVENTS = DAMAGE_EVENTS | {"SWING_DAMAGE_LANDED"}
+# Pure resource bookkeeping: high volume, no evidence about any interaction.
+RESOURCE_EVENTS = {"SPELL_ENERGIZE", "SPELL_PERIODIC_ENERGIZE", "SPELL_DRAIN",
+                   "SPELL_LEECH"}
 HEAL_EVENTS = {"SPELL_HEAL", "SPELL_PERIODIC_HEAL"}
 AURA_APPLY_EVENTS = {"SPELL_AURA_APPLIED", "SPELL_AURA_REFRESH",
                      "SPELL_AURA_APPLIED_DOSE"}
@@ -453,12 +465,11 @@ AURA_REMOVE_EVENTS = {"SPELL_AURA_REMOVED", "SPELL_AURA_REMOVED_DOSE",
 SUMMON_EVENTS = {"SPELL_SUMMON", "SPELL_CREATE"}
 DISPEL_EVENTS = {"SPELL_DISPEL", "SPELL_STOLEN"}
 ALWAYS_KEEP_ACTOR_EVENTS = {"UNIT_DIED", "UNIT_DESTROYED", "PARTY_KILL"}
-DETAIL_EVENTS = CAST_EVENTS | DAMAGE_EVENTS | HEAL_EVENTS | AURA_APPLY_EVENTS | \
-    AURA_REMOVE_EVENTS | SUMMON_EVENTS | DISPEL_EVENTS | {
+DETAIL_EVENTS = CAST_EVENTS | DAMAGE_RESULT_EVENTS | HEAL_EVENTS | AURA_APPLY_EVENTS | \
+    AURA_REMOVE_EVENTS | SUMMON_EVENTS | DISPEL_EVENTS | RESOURCE_EVENTS | {
         "SWING_MISSED", "RANGE_MISSED", "SPELL_MISSED", "SPELL_ABSORBED",
         "SPELL_HEAL_ABSORBED", "SPELL_DISPEL_FAILED", "SPELL_INTERRUPT",
         "UNIT_DIED", "UNIT_DESTROYED", "PARTY_KILL", "SPELL_RESURRECT",
-        "SPELL_ENERGIZE", "SPELL_DRAIN", "SPELL_LEECH",
     }
 
 TYPE_PLAYER = 0x00000400
@@ -486,6 +497,18 @@ def _is_pet(flags: int) -> bool:
     return bool(flags & (TYPE_PET | TYPE_GUARDIAN))
 
 
+# The secondary spell of an event means something different per family; naming it
+# after that meaning is what makes the JSON readable without the WoW docs at hand.
+EXTRA_SPELL_KEYS = {
+    "SPELL_INTERRUPT": ("interrupted_spell_id", "interrupted_spell"),
+    "SPELL_DISPEL": ("dispelled_spell_id", "dispelled_spell"),
+    "SPELL_DISPEL_FAILED": ("dispelled_spell_id", "dispelled_spell"),
+    "SPELL_STOLEN": ("dispelled_spell_id", "dispelled_spell"),
+    "SPELL_ABSORBED": ("shield_spell_id", "shield_spell"),
+    "SPELL_HEAL_ABSORBED": ("shield_spell_id", "shield_spell"),
+}
+
+
 @dataclass
 class ParsedCombatEvent:
     event: str
@@ -507,6 +530,9 @@ class ParsedCombatEvent:
     target_hp: int | None = None
     target_max_hp: int | None = None
     target_owner_guid: str | None = None
+    source_owner_guid: str | None = None
+    spec_id: int | None = None
+    item_level: int | None = None
     x: float | None = None
     y: float | None = None
     parse_fallback: bool = False
@@ -523,14 +549,27 @@ class ParsedCombatEvent:
                 death_timestamp: datetime | None = None) -> dict:
         data = {"timestamp": format_timestamp(timestamp), "event": self.event,
                 "raw": raw.decode("utf-8", errors="replace").rstrip("\r\n")}
+        supplemental = self.event == "SWING_DAMAGE_LANDED"
         for key in ("source_guid", "source_name", "destination_guid",
                     "destination_name", "spell_id", "spell_name", "amount",
-                    "overheal", "absorbed", "extra_spell_id", "extra_spell_name",
+                    "overheal", "absorbed",
                     "aura_type", "miss_type", "target_hp", "target_max_hp",
-                    "target_owner_guid", "x", "y"):
+                    "target_owner_guid", "spec_id", "item_level", "x", "y"):
+            # The swing amount is already reported by SWING_DAMAGE; LANDED only adds
+            # the victim's state, so it must not look like a second hit.
+            if supplemental and key in {"amount", "absorbed"}:
+                continue
             value = getattr(self, key)
             if value is not None:
                 data[key] = value
+        extra_keys = EXTRA_SPELL_KEYS.get(self.event)
+        if extra_keys is not None:
+            for key, value in zip(extra_keys, (self.extra_spell_id,
+                                               self.extra_spell_name)):
+                if value is not None:
+                    data[key] = value
+        if supplemental:
+            data["supplemental_state"] = True
         if death_timestamp is not None:
             data["seconds_before_death"] = round(
                 (death_timestamp - timestamp).total_seconds(), 3)
@@ -567,6 +606,37 @@ def _advanced_state(payload: list[str], base: int) -> tuple[int, int, int, str |
     return base + 19, hp, maximum, owner, x, y
 
 
+def _equipment_item_level(args: list[str], start: int) -> int | None:
+    """Average the positive item levels of COMBATANT_INFO's equipment array.
+
+    The array is the first `[(...)]` argument after the talent array (the pvp-talent
+    tuple sits between them). Each entry is (itemID, ilvl, (enchants), (bonusIDs),
+    (gems)); empty slots come as (0,0,(),(),()). Every tuple is judged on its own:
+    malformed ones and non-positive levels are ignored, so a partially broken line
+    still yields a usable average and only a fully unusable one yields None.
+    """
+    for index in range(start, len(args)):
+        text = args[index].strip()
+        if not text.startswith("[("):
+            continue
+        if not text.endswith("]"):
+            return None
+        levels = []
+        for entry in split_args(text[1:-1]):
+            entry = entry.strip()
+            if not (entry.startswith("(") and entry.endswith(")")):
+                continue
+            fields = split_args(entry[1:-1])
+            if len(fields) < 2:
+                continue
+            level = to_int(fields[1])
+            if level is not None and level > 0:
+                levels.append(level)
+        # Half-up, so an exact .5 average never depends on banker's rounding.
+        return (2 * sum(levels) + len(levels)) // (2 * len(levels)) if levels else None
+    return None
+
+
 def parse_combat_event(event: str, args: list[str]) -> ParsedCombatEvent:
     parsed = ParsedCombatEvent(event=event)
     if event == "COMBATANT_INFO":
@@ -575,7 +645,8 @@ def parse_combat_event(event: str, args: list[str]) -> ParsedCombatEvent:
         # That survived the extra 12.0 stat field (older logs used one less column).
         for index in range(20, len(args)):
             if args[index].lstrip().startswith("["):
-                parsed.spell_id = to_int(arg_at(args, index - 1))
+                parsed.spec_id = to_int(arg_at(args, index - 1))
+                parsed.item_level = _equipment_item_level(args, index + 1)
                 break
         parsed.parse_fallback = parsed.source_guid is None
         return parsed
@@ -600,26 +671,41 @@ def parse_combat_event(event: str, args: list[str]) -> ParsedCombatEvent:
         parsed.spell_id = to_int(arg_at(payload, 0))
         parsed.spell_name = unquote(arg_at(payload, 1))
     value_index = 3 if has_spell else 0
-    if event in DAMAGE_EVENTS | HEAL_EVENTS:
+    if event in DAMAGE_RESULT_EVENTS | HEAL_EVENTS:
         state_base = value_index
         advanced = _advanced_state(payload, value_index)
         if advanced is not None:
             value_index, hp, maximum, owner, x, y = advanced
             # SWING_DAMAGE's block describes the attacker, not the target. Avoid
             # labelling source health/position as the victim's state.
-            if unquote(arg_at(payload, state_base)) == parsed.destination_guid:
+            info_guid = unquote(arg_at(payload, state_base))
+            if info_guid == parsed.destination_guid:
                 parsed.target_hp, parsed.target_max_hp, parsed.x, parsed.y = \
                     hp, maximum, x, y
                 parsed.target_owner_guid = owner
+            if info_guid == parsed.source_guid:
+                parsed.source_owner_guid = owner
+    elif event in CAST_EVENTS:
+        # Casts carry a source-side block. It is read only for the owner GUID: it is
+        # the only way to attribute a pet summoned before the segment started.
+        advanced = _advanced_state(payload, 3)
+        if advanced is not None and unquote(arg_at(payload, 3)) == parsed.source_guid:
+            parsed.source_owner_guid = advanced[3]
     if event == "ENVIRONMENTAL_DAMAGE":
         value_index += 1
-    if event in DAMAGE_EVENTS:
+    if event in DAMAGE_RESULT_EVENTS:
         parsed.amount = to_int(arg_at(payload, value_index))
         tail = payload[value_index:]
-        expected_school = 1 if event == "SWING_DAMAGE" else _flags(arg_at(payload, 2))
+        expected_school = 1 if event in {"SWING_DAMAGE", "SWING_DAMAGE_LANDED"} \
+            else _flags(arg_at(payload, 2))
         modern_damage = (event == "ENVIRONMENTAL_DAMAGE" and len(tail) >= 10) or \
             bool(tail and unquote(tail[-1]) in {"ST", "AOE"})
-        if not modern_damage and len(tail) >= 11 and expected_school:
+        # Modern swing tails have no ST/AOE marker and are one field shorter than
+        # spell tails (no isOffHand): amount, base, overkill, school, resisted,
+        # blocked, absorbed, critical, glancing, crushing. The school position
+        # (index 3 modern vs index 2 legacy) is the discriminator.
+        minimum_tail = 10 if event in {"SWING_DAMAGE", "SWING_DAMAGE_LANDED"} else 11
+        if not modern_damage and len(tail) >= minimum_tail and expected_school:
             modern_damage = (_flags(arg_at(payload, value_index + 3)) == expected_school and
                              _flags(arg_at(payload, value_index + 2)) != expected_school)
         parsed.absorbed = to_int(arg_at(payload, value_index +
@@ -676,6 +762,7 @@ class _AnalysisRecord:
 
 def _new_player(guid: str, name: str | None) -> dict:
     return {"guid": guid, "name": name, "spec_id": None, "role": None,
+            "class_id": None,
             "item_level": None, "deaths": 0, "interrupts": 0, "dispels": 0,
             "damage_done": 0, "damage_taken": 0, "healing_done": 0,
             "healing_received": 0, "self_healing": 0, "absorbs_received": 0,
@@ -698,13 +785,32 @@ SPEC_ROLES = {
     1473: "DAMAGER", 1480: "DAMAGER",
 }
 
+# Spec id -> WoW class id (1..13). Derived from the same Retail spec ids as SPEC_ROLES,
+# so a COMBATANT_INFO line identifies the class without any external table.
+SPEC_CLASSES = {
+    71: 1, 72: 1, 73: 1,
+    65: 2, 66: 2, 70: 2,
+    253: 3, 254: 3, 255: 3,
+    259: 4, 260: 4, 261: 4,
+    256: 5, 257: 5, 258: 5,
+    250: 6, 251: 6, 252: 6,
+    262: 7, 263: 7, 264: 7,
+    62: 8, 63: 8, 64: 8,
+    265: 9, 266: 9, 267: 9,
+    268: 10, 269: 10, 270: 10,
+    102: 11, 103: 11, 104: 11, 105: 11,
+    577: 12, 581: 12,
+    1467: 13, 1468: 13, 1473: 13,
+}
+
 
 class AnalysisSession:
     """One bounded, streaming analysis pipeline for a single extracted segment."""
 
-    def __init__(self, stage_dir: str, kind: str):
+    def __init__(self, stage_dir: str, kind: str, keep_player_damage: bool = False):
         self.stage_dir = stage_dir
         self.kind = kind
+        self.keep_player_damage = keep_player_damage
         os.makedirs(stage_dir, exist_ok=True)
         self.combat_raw_path = os.path.join(stage_dir, "combat.raw")
         self.deaths_spool_path = os.path.join(stage_dir, "deaths.jsonl")
@@ -723,7 +829,7 @@ class AnalysisSession:
         self.spell_keys: set[tuple[str, int | None]] = set()
         self.interrupts: list[dict] = []
         self.dispels: list[dict] = []
-        self.enemy_cast_successes: dict[str, int] = {}
+        self.enemy_cast_successes: dict[tuple[int | None, str | None], int] = {}
         self.parse_fallbacks: dict[str, int] = {}
         self.event_counts: dict[str, int] = {}
         self.total_player_deaths = 0
@@ -819,8 +925,10 @@ class AnalysisSession:
         for record in self.history:
             # Causal look-back promotes this actor's own prior casts/auras. Merely
             # targeting a now-known hostile does not make an unrelated NPC relevant.
+            # The very same policy decides: a line the policy rejects is never
+            # resurrected here, and the record flags keep the promotion idempotent.
             if record.parsed.source_guid == guid:
-                self._select_record(record)
+                self._apply_policy(record)
 
     def _remember_pet(self, pet: str | None, owner: str | None,
                       timestamp: datetime) -> None:
@@ -838,8 +946,69 @@ class AnalysisSession:
         if player is not None and pet not in player["pets"]:
             player["pets"].append(pet)
 
+    @staticmethod
+    def _owned_pet_claim(pet: str | None, pet_flags: int, owner: str | None) -> bool:
+        """Only a friendly pet/guardian with a Player owner may be claimed as ours.
+
+        An enemy player's pet also carries a Player owner GUID in its advanced block;
+        it must stay a plain hostile so its damage is attributed to nobody.
+        """
+        return bool(pet and owner and _is_player(owner) and _is_pet(pet_flags) and
+                    not pet_flags & REACTION_HOSTILE)
+
     def _relevant(self, guid: str | None, flags: int = 0) -> bool:
         return bool(_is_player(guid, flags) or guid in self.pet_owners or guid in self.hostiles)
+
+    def _own_pet(self, guid: str | None) -> bool:
+        """A pet whose owner is a known player. Boss summons also live in pet_owners
+        (with a Creature owner) and must not count as friendly units."""
+        return _is_player(self.pet_owners.get(guid or ""))
+
+    def _friendly(self, guid: str | None, flags: int = 0) -> bool:
+        return _is_player(guid, flags) or self._own_pet(guid)
+
+    def _keep_policy(self, parsed: ParsedCombatEvent) -> tuple[bool, bool]:
+        """Decide, once per record, whether it feeds the aggregates and whether its
+        raw line belongs in combat.txt. See plans/analysis-gap-fixes.md for the table.
+        """
+        event = parsed.event
+        if event in STRUCTURAL_EVENTS or event in ALWAYS_KEEP_ACTOR_EVENTS or \
+                parsed.parse_fallback:
+            return True, True
+        if event in RESOURCE_EVENTS:
+            return False, False
+        friendly_source = self._friendly(parsed.source_guid, parsed.source_flags)
+        friendly_target = self._friendly(parsed.destination_guid,
+                                         parsed.destination_flags)
+        if event == "SWING_DAMAGE_LANDED":
+            # Never counted: the paired SWING_DAMAGE already carries the amount.
+            if friendly_target:
+                return False, True
+            return False, bool(self.keep_player_damage and friendly_source)
+        if friendly_source and not friendly_target and \
+                (event in DAMAGE_EVENTS or event == "SPELL_ABSORBED"):
+            # Outgoing results answer none of the analysis questions, but their totals
+            # do: aggregate them always, keep the raw line only when asked to.
+            return True, self.keep_player_damage
+        direct_player = parsed.source_is_player or parsed.destination_is_player
+        # Only heals between units nobody owns are noise: a heal landing on a
+        # player or on an owned pet is evidence, whoever cast it.
+        pet_only_heal = event in HEAL_EVENTS and not direct_player and \
+            not friendly_target and \
+            (_is_pet(parsed.source_flags) or parsed.source_guid in self.pet_owners) and \
+            (_is_pet(parsed.destination_flags) or
+             parsed.destination_guid in self.pet_owners)
+        keep = not pet_only_heal and (
+            direct_player or friendly_target or
+            self._relevant(parsed.source_guid, parsed.source_flags))
+        return keep, keep
+
+    def _apply_policy(self, record: _AnalysisRecord) -> None:
+        count, write = self._keep_policy(record.parsed)
+        if count:
+            self._count_record(record)
+        if write:
+            self._select_record(record)
 
     def _add_spell_key(self, kind: str, spell_id: int | None,
                        timestamp: datetime) -> bool:
@@ -899,18 +1068,21 @@ class AnalysisSession:
                 self._warn("dispel_details_truncated", MAX_DISPEL_DETAILS, timestamp)
         if parsed.event == "SPELL_CAST_SUCCESS" and parsed.source_guid in self.hostiles and \
                 spell_admitted:
-            key = str(parsed.spell_id) if parsed.spell_id is not None else \
-                (parsed.spell_name or "unknown")
+            key = (parsed.spell_id, parsed.spell_name)
             self.enemy_cast_successes[key] = self.enemy_cast_successes.get(key, 0) + 1
 
-    def _select_record(self, record: _AnalysisRecord) -> None:
-        record.selected = True
+    def _count_record(self, record: _AnalysisRecord) -> None:
+        """Count a record once, whether or not its raw line is kept."""
         if record.aggregated:
             return
         record.aggregated = True
         event = record.parsed.event
         self.event_counts[event] = self.event_counts.get(event, 0) + 1
         self._aggregate(record.parsed, record.timestamp)
+
+    def _select_record(self, record: _AnalysisRecord) -> None:
+        """Mark a record's raw line for combat.txt."""
+        record.selected = True
 
     def _auras(self, parsed: ParsedCombatEvent, timestamp: datetime) -> None:
         key = (parsed.destination_guid or "", parsed.spell_id, parsed.source_guid)
@@ -959,6 +1131,8 @@ class AnalysisSession:
 
         def death_relevant(item: _AnalysisRecord) -> bool:
             candidate = item.parsed
+            if candidate.event in RESOURCE_EVENTS:
+                return False
             if candidate.destination_guid == player_guid:
                 return True
             if candidate.event in STRUCTURAL_EVENTS | ALWAYS_KEEP_ACTOR_EVENTS:
@@ -1045,8 +1219,13 @@ class AnalysisSession:
             self.parse_fallbacks["UNPARSEABLE"] = \
                 self.parse_fallbacks.get("UNPARSEABLE", 0) + 1
             self._warn("parse_fallback", 0, timestamp)
-            self.history.append(_AnalysisRecord(timestamp, raw, parsed, True))
+            record = _AnalysisRecord(timestamp, raw, parsed)
+            self.history.append(record)
             self.history_bytes += len(raw)
+            # Same route as every other record: the parse-fallback row of the
+            # policy table counts it too, so event_counts reports what
+            # combat.txt actually contains.
+            self._apply_policy(record)
             self._trim_history(timestamp)
             return
         self._expire(timestamp)
@@ -1066,17 +1245,25 @@ class AnalysisSession:
             self._player(parsed.source_guid, parsed.source_name, timestamp)
         if parsed.destination_is_player:
             self._player(parsed.destination_guid, parsed.destination_name, timestamp)
-        if parsed.target_owner_guid and _is_player(parsed.target_owner_guid) and \
-                _is_pet(parsed.destination_flags):
-            self._player(parsed.target_owner_guid, None, timestamp)
-            self._remember_pet(parsed.destination_guid, parsed.target_owner_guid, timestamp)
+        # An advanced block names the owner of the unit it describes. That is the only
+        # evidence available for a pet summoned before the segment started.
+        for pet_guid, pet_flags, owner in (
+                (parsed.destination_guid, parsed.destination_flags,
+                 parsed.target_owner_guid),
+                (parsed.source_guid, parsed.source_flags, parsed.source_owner_guid)):
+            if self._owned_pet_claim(pet_guid, pet_flags, owner):
+                self._player(owner, None, timestamp)
+                self._remember_pet(pet_guid, owner, timestamp)
         if event == "COMBATANT_INFO" and parsed.source_guid:
             player = self._player(parsed.source_guid, None, timestamp)
             if player is not None:
-                player["spec_id"] = parsed.spell_id
-                player["role"] = SPEC_ROLES.get(parsed.spell_id)
+                player["spec_id"] = parsed.spec_id
+                player["role"] = SPEC_ROLES.get(parsed.spec_id)
+                player["class_id"] = SPEC_CLASSES.get(parsed.spec_id)
+                if parsed.item_level is not None:
+                    player["item_level"] = parsed.item_level
         direct_player = parsed.source_is_player or parsed.destination_is_player
-        if direct_player:
+        if direct_player and event not in RESOURCE_EVENTS:
             other_guid = (parsed.destination_guid if parsed.source_is_player
                           else parsed.source_guid)
             other_flags = (parsed.destination_flags if parsed.source_is_player
@@ -1088,22 +1275,15 @@ class AnalysisSession:
         if event in SUMMON_EVENTS and self._relevant(parsed.source_guid, parsed.source_flags):
             owner = self.pet_owners.get(parsed.source_guid or "", parsed.source_guid)
             self._remember_pet(parsed.destination_guid, owner, timestamp)
-        source_relevant = self._relevant(parsed.source_guid, parsed.source_flags)
-        pet_only_heal = event in HEAL_EVENTS and not direct_player and \
-            (_is_pet(parsed.source_flags) or parsed.source_guid in self.pet_owners) and \
-            (_is_pet(parsed.destination_flags) or parsed.destination_guid in self.pet_owners)
-        selected = (event in STRUCTURAL_EVENTS or event in ALWAYS_KEEP_ACTOR_EVENTS or
-                    parsed.parse_fallback or direct_player or
-                    (source_relevant and not pet_only_heal))
-        for guid in (parsed.source_guid, parsed.destination_guid):
-            if guid in self.hostiles:
-                self.hostiles.pop(guid)
-                self.hostiles[guid] = timestamp
+        if event not in RESOURCE_EVENTS:
+            for guid in (parsed.source_guid, parsed.destination_guid):
+                if guid in self.hostiles:
+                    self.hostiles.pop(guid)
+                    self.hostiles[guid] = timestamp
         record = _AnalysisRecord(timestamp, raw, parsed)
         self.history.append(record)
         self.history_bytes += len(raw)
-        if selected:
-            self._select_record(record)
+        self._apply_policy(record)
         self._trim_history(timestamp)
         if event == "UNIT_DIED" and parsed.destination_is_player:
             self._write_death(record)
@@ -1175,7 +1355,15 @@ class AnalysisSession:
             target.flush()
             os.fsync(target.fileno())
 
-    def summary_and_players(self, segment_metadata: dict) -> tuple[dict, list[dict]]:
+    def _enemy_cast_rows(self) -> list[dict]:
+        """Readable, deterministic list: an id alone tells a reader nothing."""
+        rows = [{"spell_id": spell_id, "spell_name": spell_name, "count": count}
+                for (spell_id, spell_name), count in self.enemy_cast_successes.items()]
+        rows.sort(key=lambda row: (-row["count"], row["spell_id"] is None,
+                                   row["spell_id"] or 0, row["spell_name"] or ""))
+        return rows
+
+    def summary_and_players(self, segment_metadata: dict) -> tuple[dict, dict]:
         summary = dict(segment_metadata)
         summary.update({
             "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
@@ -1184,7 +1372,7 @@ class AnalysisSession:
             "player_deaths": self.total_player_deaths,
             "combat_lines": self.combat_lines,
             "event_counts": dict(sorted(self.event_counts.items())),
-            "enemy_cast_successes": dict(sorted(self.enemy_cast_successes.items())),
+            "enemy_cast_successes": self._enemy_cast_rows(),
             "interrupts": self.interrupts,
             "interrupt_count": self.total_interrupts,
             "dispels": self.dispels,
@@ -1194,9 +1382,9 @@ class AnalysisSession:
         })
         players = sorted((dict(value) for value in self.players.values()),
                          key=lambda value: value["guid"])
-        return summary, players
+        return summary, {"players": players}
 
-    def result(self, segment_metadata: dict) -> tuple[dict, list[dict], list[dict]]:
+    def result(self, segment_metadata: dict) -> tuple[dict, dict, list[dict]]:
         summary, players = self.summary_and_players(segment_metadata)
         deaths = self.deaths()
         encounter = self._encounter_for(segment_metadata)
@@ -1257,7 +1445,9 @@ class Segment:
         if self.output_options.wants_analysis:
             if stage_dir is None:
                 raise RuntimeError("analysis staging directory was not created")
-            self.analysis_session = AnalysisSession(stage_dir, self.kind)
+            self.analysis_session = AnalysisSession(
+                stage_dir, self.kind,
+                keep_player_damage=self.output_options.keep_player_damage)
 
     def write(self, raw: bytes, timestamp: datetime | None = None,
               event: str | None = None, args: list[str] | None = None) -> None:
@@ -1636,6 +1826,18 @@ class SegmentPublisher:
                 combat_names = [item for item in analysis_paths if item.startswith("combat.")]
                 publish_order = ["summary.json"] + combat_names + \
                     ["deaths.json", "players.json"]
+                # Every profile publishes into the same analysis folder, replacing
+                # the payload one file at a time. Retire the previous marker (and the
+                # other container's combat body) first: a crash mid-replacement must
+                # leave an obviously incomplete package, never a marker still
+                # advertising the profile being overwritten. State has not advanced,
+                # so the next run of this profile republishes over the same names.
+                for obsolete in ("metadata.json",
+                                 "combat.txt" if self.options.gzip else "combat.txt.gz"):
+                    try:
+                        os.remove(os.path.join(analysis_dir, obsolete))
+                    except FileNotFoundError:
+                        pass
                 for filename in publish_order:
                     _copy_atomic(analysis_paths[filename], os.path.join(analysis_dir, filename))
                 embedded = dict(analysis_metadata)
@@ -2119,6 +2321,32 @@ class StateStore:
             return 0  # replaced/rewritten log: reprocess from the beginning
         return offset
 
+    def claim(self, path: str) -> bool:
+        """Take ownership of a file's state before this profile starts publishing.
+
+        Publication replaces the shared <name>/ destinations and can crash half-way;
+        if the previous owner's EOF offset survived until the commit, switching back
+        to that profile would never repair the package. Dropping the other profiles'
+        entries up front makes any later run of any profile re-scan and converge.
+        Returns True when the stored state changed.
+        """
+        self._migrate_v2()
+        name = os.path.basename(path)
+        entry = self.data.get("files", {}).get(name)
+        if not isinstance(entry, dict):
+            return False
+        profiles = entry.get("profiles")
+        if not isinstance(profiles, dict) or set(profiles) <= {self.profile}:
+            return False
+        own = profiles.get(self.profile)
+        new_entry: dict = {"profiles": {}}
+        if isinstance(own, dict):
+            new_entry["profiles"][self.profile] = own
+            if self.profile == "full" and (to_int(str(own.get("offset", 0))) or 0) > 0:
+                new_entry.update(own)
+        self.data["files"][name] = new_entry
+        return True
+
     def update(self, path: str, offset: int) -> None:
         offset = max(0, int(offset))
         try:
@@ -2136,19 +2364,15 @@ class StateStore:
         }
         self._migrate_v2()
         name = os.path.basename(path)
-        entry = self.data["files"].get(name)
-        if not isinstance(entry, dict):
-            entry = {"profiles": {}}
-        profiles = entry.get("profiles")
-        if not isinstance(profiles, dict):
-            profiles = {}
-        profiles[self.profile] = profile_entry
-        # Replace the entry wholesale so stale v1 fields cannot claim a non-full
-        # profile's offset to an older binary.
-        new_entry: dict = {"profiles": profiles}
-        full = profiles.get("full")
-        if isinstance(full, dict) and (to_int(str(full.get("offset", 0))) or 0) > 0:
-            new_entry.update(full)
+        # A publication owns the shared destinations under <name>/, so the offsets
+        # recorded for other profiles no longer describe what is on disk: drop them.
+        # Switching flags therefore backfills the file exactly once (the republish
+        # reuses the same names) while repeating the same flags still does nothing.
+        # Artifacts already written by another profile are never deleted.
+        new_entry: dict = {"profiles": {self.profile: profile_entry}}
+        if self.profile == "full" and offset > 0:
+            # v1 mirror: only the full profile may claim the top-level offset.
+            new_entry.update(profile_entry)
         self.data["files"][name] = new_entry
 
 
@@ -2397,6 +2621,8 @@ class Extractor:
             try:
                 processor = FileProcessor(path, self.publisher,
                                           self.state.get_offset(path))
+                if self.state.claim(path):
+                    self.state.save()
                 processor.process_new_data()
                 processor.finish(is_latest=(path == latest))
                 # Outputs are published before the offset advances.
@@ -2450,6 +2676,8 @@ class Extractor:
                         if worker is None:
                             worker = FileProcessor(path, self.publisher,
                                                    self.state.get_offset(path))
+                            if self.state.claim(path):
+                                self.state.save()
                             workers[name] = worker
                         worker.process_new_data()
                         if path != latest:
@@ -2514,6 +2742,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="store requested full/combat bodies as deterministic gzip")
     parser.add_argument("--bundle", action="store_true",
                         help="also create an analysis-only ZIP (requires an analysis mode)")
+    parser.add_argument("--keep-player-damage", dest="keep_player_damage",
+                        action="store_true",
+                        help="keep outgoing player/pet damage lines in combat.txt "
+                             "(requires an analysis mode)")
     parser.add_argument("--log-dir", dest="log_dir", default=None,
                         help=r"WoW Logs folder (...\World of Warcraft\_retail_\Logs)")
     parser.add_argument("--output", dest="output", default=None,
@@ -2532,7 +2764,8 @@ def run(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         options = OutputOptions(analysis=args.analysis, analysis_only=args.analysis_only,
-                                gzip=args.gzip, bundle=args.bundle)
+                                gzip=args.gzip, bundle=args.bundle,
+                                keep_player_damage=args.keep_player_damage)
     except ValueError as exc:
         parser.error(str(exc))
     log_dir, output_dir = resolve_paths(args.log_dir, args.output, args.config,
