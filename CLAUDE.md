@@ -14,3 +14,7 @@ logs de WoW Retail. Ver `plans/wow-log-extractor.md` para el diseño completo.
 - Los segmentos se copian byte a byte: no filtrar ni reescribir líneas del log.
 - Al reanudar por offset guardado, validar la huella (hash) del prefijo ya consumido, no
   solo el tamaño: un log reemplazado puede ser más grande que el offset anterior.
+- Todos los perfiles de salida (`full`, `--analysis*`, `--gzip`, `--bundle`, `--keep-player-damage`)
+  publican sobre los mismos nombres (`<basename>.txt`, `<basename>/analysis/`). Cualquier cambio en
+  la publicación o en `StateStore` debe probarse con un crash a mitad de una republicación bajo otro
+  perfil y con la vuelta al perfil anterior: dos revisiones independientes han encontrado bugs ahí.

@@ -1397,6 +1397,8 @@ class AnalysisBundleTests(ExtractorTestCase):
     PLAYER = "Player-1-00000001"
     HEALER = "Player-1-00000002"
     PET = "Pet-0-0001-0002-0003-000000000001"
+    # Never summoned and never linked to an owner: the canonical irrelevant unit.
+    STRAY_PET = "Pet-0-0001-0002-0003-000000000007"
     ENEMY = "Creature-0-0001-0002-0003-000000000099"
     OTHER_ENEMY = "Creature-0-0001-0002-0003-000000000098"
 
@@ -1463,7 +1465,8 @@ class AnalysisBundleTests(ExtractorTestCase):
                        self.OTHER_ENEMY, "Trash A", 68168, self.ENEMY, boss, 68168,
                        "1", q("NPC noise"), "1", "1", "0", "1", "0", "0", "0", "0")
         self.add_event(builder, start + timedelta(seconds=12), "SPELL_HEAL",
-                       self.PET, "Lobo", 4370, self.PET, "Lobo", 4370,
+                       self.STRAY_PET, "Perro callejero", 4370,
+                       self.STRAY_PET, "Perro callejero", 4370,
                        "1", q("Pet noise"), "1", "20", "0", "0", "0")
         self.add_event(builder, start + timedelta(seconds=13), "UNIT_DIED",
                        "0000000000000000", "nil", 0, self.PLAYER, "Álvaro", 1297)
@@ -1494,11 +1497,16 @@ class AnalysisBundleTests(ExtractorTestCase):
         with open(os.path.join(analysis_dir, "combat.txt"), encoding="utf-8") as handle:
             combat = handle.read()
         for expected in ("COMBATANT_INFO", "Dark Bolt", "Flash Heal", "Power Word: Shield",
-                         "SPELL_INTERRUPT", "SPELL_DISPEL", "Call Pet", "Bite", "UNIT_DIED"):
+                         "SPELL_INTERRUPT", "SPELL_DISPEL", "Call Pet", "UNIT_DIED"):
             self.assertIn(expected, combat)
         self.assertNotIn("NPC noise", combat)
         self.assertNotIn("Pet noise", combat)
+        # Outgoing pet damage is aggregated but not written unless asked for.
+        self.assertNotIn("Bite", combat)
         self.assertLess(combat.index("SPELL_CAST_START"), combat.index("SPELL_DAMAGE"))
+
+    def test_pet_to_npc_damage_is_written_only_with_keep_player_damage(self):
+        self.assertIn("Bite", self._combat_text(analysis=True, keep_player_damage=True))
 
     def test_death_window_players_and_pet_ownership_are_objective(self):
         _, basename = self._run_analysis_raid(analysis=True)
@@ -1518,7 +1526,7 @@ class AnalysisBundleTests(ExtractorTestCase):
         self.assertIn("Flash Heal", encoded)
         self.assertIn("Power Word: Shield", encoded)
 
-        players = self.read_json(os.path.join(analysis_dir, "players.json"))
+        players = self.read_json(os.path.join(analysis_dir, "players.json"))["players"]
         player = next(row for row in players if row["guid"] == self.PLAYER)
         self.assertEqual(player["name"], "Álvaro")
         self.assertIn(self.PET, json.dumps(player, ensure_ascii=False))
@@ -1611,8 +1619,9 @@ class AnalysisBundleTests(ExtractorTestCase):
     # Keep the required filter cases independently named: a failure pinpoints the
     # policy regression instead of leaving a reviewer to infer it from one omnibus
     # fixture assertion.
-    def _combat_text(self):
-        _, basename = self._run_analysis_raid(analysis=True)
+    def _combat_text(self, **option_values):
+        option_values.setdefault("analysis", True)
+        _, basename = self._run_analysis_raid(**option_values)
         with open(os.path.join(self._analysis_dir(basename), "combat.txt"), encoding="utf-8") as h:
             return h.read()
 
@@ -1622,8 +1631,22 @@ class AnalysisBundleTests(ExtractorTestCase):
     def test_filter_player_to_npc_interrupt_is_retained(self):
         self.assertIn("SPELL_INTERRUPT", self._combat_text())
 
-    def test_filter_direct_player_to_npc_damage_is_retained(self):
-        self.assertIn("Sinister Strike", self._combat_text())
+    def test_filter_direct_player_to_npc_damage_is_aggregated_not_written_by_default(self):
+        _, basename = self._run_analysis_raid(analysis=True)
+        with open(os.path.join(self._analysis_dir(basename), "combat.txt"),
+                  encoding="utf-8") as handle:
+            self.assertNotIn("Sinister Strike", handle.read())
+        summary = self.read_json(os.path.join(self._analysis_dir(basename), "summary.json"))
+        players = self.read_json(os.path.join(self._analysis_dir(basename),
+                                              "players.json"))["players"]
+        player = next(row for row in players if row["guid"] == self.PLAYER)
+        # 700 (Sinister Strike) + 500 (the pet's Bite, attributed to its owner).
+        self.assertEqual(player["damage_done"], 1200)
+        self.assertEqual(summary["event_counts"]["SPELL_DAMAGE"], 3)
+
+    def test_filter_direct_player_to_npc_damage_is_written_with_keep_player_damage(self):
+        self.assertIn("Sinister Strike",
+                      self._combat_text(analysis=True, keep_player_damage=True))
 
     def test_filter_unknown_npc_to_npc_is_discarded(self):
         self.assertNotIn("NPC noise", self._combat_text())
@@ -1641,13 +1664,15 @@ class AnalysisBundleTests(ExtractorTestCase):
 
     def test_combatant_info_identifies_player_and_preserves_unicode(self):
         _, basename = self._run_analysis_raid(analysis=True)
-        players = self.read_json(os.path.join(self._analysis_dir(basename), "players.json"))
+        players = self.read_json(
+            os.path.join(self._analysis_dir(basename), "players.json"))["players"]
         self.assertTrue(any(row["guid"] == self.PLAYER and row["name"] == "Álvaro"
                             for row in players))
 
     def test_pet_owner_link_is_retained_without_creating_pet_player(self):
         _, basename = self._run_analysis_raid(analysis=True)
-        players = self.read_json(os.path.join(self._analysis_dir(basename), "players.json"))
+        players = self.read_json(
+            os.path.join(self._analysis_dir(basename), "players.json"))["players"]
         self.assertFalse(any(row["guid"] == self.PET for row in players))
         self.assertIn(self.PET, json.dumps(players, ensure_ascii=False))
 
@@ -1680,6 +1705,13 @@ class AnalysisBundleTests(ExtractorTestCase):
         self.assertEqual(analysis.run_once(), (0, 0, 0))
         self.assertEqual(self.list_outputs(self.raids_dir()), after_first_backfill)
         self.assertTrue(set(original).issubset(after_first_backfill))
+        # The analysis publication owns the shared destinations, so it also owns the
+        # state entry: the full profile's offset is dropped (it would republish once)
+        # while every artifact the full profile wrote stays untouched on disk.
+        entry = self.read_json(self.state_path)["files"][LOG_NAME]
+        self.assertEqual(list(entry["profiles"]),
+                         [self.options(analysis_only=True).profile])
+        self.assertNotIn("offset", entry)
 
     def test_analysis_watch_finalizes_and_repeating_watch_creates_no_duplicate(self):
         builder = self._build_raid_with_actor_events()
@@ -1714,9 +1746,11 @@ class AnalysisBundleTests(ExtractorTestCase):
         self.assertEqual(state["version"], 2)
         entry = state["files"][os.path.basename(log_path)]
         self.assertIn("profiles", entry)
-        self.assertIn(self.options(analysis_only=True).profile, entry["profiles"])
-        self.assertEqual(entry["offset"], offset,
-                         "v1 downgrade fields must keep the full profile offset")
+        self.assertEqual(list(entry["profiles"]),
+                         [self.options(analysis_only=True).profile])
+        # The v1 top-level mirror belongs to the full profile alone: an analysis-only
+        # publication must not claim that offset for a binary that ignores profiles.
+        self.assertNotIn("offset", entry)
 
     def test_real_retail_advanced_payload_offsets_are_parsed_objectively(self):
         damage_line = (
@@ -1759,8 +1793,9 @@ class AnalysisBundleTests(ExtractorTestCase):
         args = [self.PLAYER] + ["0"] * 23 + ["1480", "[(90929,112839,1)]",
                                                      "()", "[]", "[]"]
         parsed = wle.parse_combat_event("COMBATANT_INFO", args)
-        self.assertEqual(parsed.spell_id, 1480)
-        self.assertEqual(wle.SPEC_ROLES[parsed.spell_id], "DAMAGER")
+        self.assertEqual(parsed.spec_id, 1480)
+        self.assertIsNone(parsed.spell_id)
+        self.assertEqual(wle.SPEC_ROLES[parsed.spec_id], "DAMAGER")
 
     def test_real_retail_absorb_forms_keep_amount_and_shield(self):
         swing_args = list(self.header(self.ENEMY, "Enemy", 68168,
@@ -1821,7 +1856,7 @@ class AnalysisBundleTests(ExtractorTestCase):
     def test_summary_players_and_metadata_have_objective_aggregates(self):
         _, basename = self._run_analysis_raid(analysis=True)
         analysis_dir = self._analysis_dir(basename)
-        players = self.read_json(os.path.join(analysis_dir, "players.json"))
+        players = self.read_json(os.path.join(analysis_dir, "players.json"))["players"]
         player = next(row for row in players if row["guid"] == self.PLAYER)
         self.assertEqual(player["spec_id"], 65)
         self.assertEqual(player["role"], "HEALER")
@@ -2034,9 +2069,681 @@ class AnalysisBundleTests(ExtractorTestCase):
                                                   "metadata.json"))]
         self.assertEqual(len(bundles), 1)
 
+    # --- v2 relevance policy, parser fields and JSON shapes ------------------------
+
+    # The 17 fields that follow (infoGUID, ownerGUID) in Retail's advanced block,
+    # copied from a real 12.x line so the offsets are not invented.
+    ADVANCED_TAIL = ["375809", "375809", "7580", "15292", "3186", "0", "0", "20902",
+                     "3", "140", "200", "0", "1321.13", "2058.02", "2500", "5.7692",
+                     "302"]
+    REAL_PET = "Pet-0-3891-2859-182905-417-0204A8C513"
+    REAL_OWNER = "Player-1408-0B450687"
+    REAL_SWING = (
+        '8/30/2026 10:23:24.1000  SWING_DAMAGE,Pet-0-3891-2859-182905-417-0204A8C513,'
+        '"Ghaazun",0x1112,0x80000000,Creature-0-3891-2859-182905-245336-000513F705,'
+        '"Siembrahechizos radiante",0x10a48,0x80000000,'
+        'Pet-0-3891-2859-182905-417-0204A8C513,Player-1408-0B450687,375809,375809,'
+        '7580,15292,3186,0,0,20902,3,140,200,0,1321.13,2058.02,2500,5.7692,302,2131,'
+        '3044,-1,1,0,0,0,nil,nil,nil')
+    REAL_PET_CAST = (
+        '8/30/2026 10:23:25.1000  SPELL_CAST_SUCCESS,'
+        'Pet-0-3891-2859-182905-417-0204A8C513,"Ghaazun",0x1112,0x80000000,'
+        '0000000000000000,nil,0x80000000,0x80000000,108446,"Enlace de alma",0x20,'
+        'Pet-0-3891-2859-182905-417-0204A8C513,Player-1408-0B450687,375809,375809,'
+        '7580,15292,3186,0,0,0,3,200,200,0,1288.25,2128.34,2500,4.8837,302')
+    REAL_LANDED = (
+        '8/30/2026 10:23:26.1000  SWING_DAMAGE_LANDED,'
+        'Creature-0-3891-2859-182905-245345-000813F705,"Azotador atiborrado de Luz",'
+        '0xa48,0x80000000,Player-3674-07CF2453,"Greendecay-TwistingNether-EU",0x20512,'
+        '0x80000020,Player-3674-07CF2453,0000000000000000,1045159,1154320,3535,344,'
+        '7160,474,301,0,6,100,1250,0,1310.69,2068.63,2500,5.1383,306,109161,288458,-1,'
+        '1,0,0,0,nil,nil,nil')
+    REAL_COMBATANT_INFO = (
+        '8/30/2026 10:23:27.1000  COMBATANT_INFO,Player-1929-09EA2DF6,1,513,622,33109,'
+        '3062,0,0,0,0,864,864,864,0,233,827,827,827,59,671,406,406,406,981,1480,'
+        '[(90929,112839,1),(90931,112841,1)],(0,354489,1261697,205596),'
+        '[(250033,289,(7961,0,0),(13338,13440,6652,13575,12806,13534),(240908,295)),'
+        '(273781,311,(),(12843,13440,41,13668,12699),(240898,295)),'
+        '(273774,311,(),(12843,13440,6652,13662,12699),()),(0,0,(),(),()),'
+        '(251159,311,(),(12843,13440,41,13662,12699),()),'
+        '(251235,311,(),(12843,13440,40,13696,13662,12699),()),'
+        '(159313,311,(),(12843,13440,6652,13662,12699),()),'
+        '(251153,311,(),(12843,13440,6652,13662,12699),()),'
+        '(268240,308,(),(6652,13696,13662,13333,12838),()),'
+        '(156489,305,(),(8902,12841,7756,13662,12699),()),'
+        '(252258,311,(7965,0,0),(12843,13440,6652,13668,12699),(240898,295)),'
+        '(158366,311,(7965,0,0),(12843,13440,6652,13668,12699),(240898,295)),'
+        '(270164,305,(),(6652,13333,12841,13662,13696),()),'
+        '(250215,311,(),(12843,13440,6652,12699),()),'
+        '(156339,308,(),(7756,13662,12838),()),'
+        '(160216,311,(0,8051,0),(12843,13440,6652,12701),()),'
+        '(251225,311,(0,8051,0),(12843,13440,41,12701),()),(0,0,(),(),())],'
+        '[Player-1929-09EA2DF6,1284644,1,Player-1378-0B26B0FA,1126,1,'
+        'Player-1379-0AF0E3DD,1459,1],85,0,0,0')
+
+    def _session(self, **kwargs):
+        """A session in its own stage, closed before that stage is removed."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        session = wle.AnalysisSession(temp.name, wle.KIND_RAID, **kwargs)
+        self.addCleanup(session.close_streams)
+        return session
+
+    def _feed(self, session, timestamp, event, args):
+        args = list(args)
+        session.consume(line_bytes(timestamp, event, *args), timestamp, event, args)
+
+    def _feed_real(self, session, timestamp, text):
+        _, event, args = wle.parse_line(text, 2026)
+        session.consume(text.encode("utf-8") + b"\r\n", timestamp, event, args)
+
+    @staticmethod
+    def _combat_of(session):
+        session.close_streams()
+        with open(session.combat_raw_path, "rb") as handle:
+            return handle.read().decode("utf-8")
+
+    def _spell_args(self, source, source_flags, destination, dest_flags, spell_id,
+                    name, *payload):
+        return list(self.header(source, "Src", source_flags, destination, "Dst",
+                                dest_flags)) + [spell_id, q(name), "1", *payload]
+
+    def _damage_args(self, source, source_flags, destination, dest_flags, name, amount):
+        return self._spell_args(source, source_flags, destination, dest_flags, "7",
+                                name, amount, "0", "1", "0", "0", "0")
+
+    def _swing_args(self, event_source, source_flags, destination, dest_flags,
+                    info_guid, owner, amount):
+        """A swing with the 19-field advanced block describing `info_guid`."""
+        return list(self.header(event_source, "Src", source_flags, destination, "Dst",
+                                dest_flags)) + [info_guid, owner] + self.ADVANCED_TAIL + \
+            [amount, "3044", "-1", "1", "0", "0", "0", "nil", "nil", "nil"]
+
+    def _summon_args(self, pet, spell_id="883", name="Call Pet"):
+        return list(self.header(self.PLAYER, "Player", 1297, pet, "Pet", 4370)) + \
+            [spell_id, q(name), "1"]
+
+    def test_keep_policy_table_rows_decide_count_and_write(self):
+        player, enemy, other, pet = self.PLAYER, self.ENEMY, self.OTHER_ENEMY, self.PET
+        second_pet = "Pet-0-0001-0002-0003-000000000002"
+        summon = ("SPELL_SUMMON", self._summon_args(pet))
+        cases = [
+            dict(name="structural COMBATANT_INFO", event="COMBATANT_INFO",
+                 args=[player] + ["0"] * 23 + ["65", "[(1,2,1)]", "()", "[]", "[]"],
+                 marker="COMBATANT_INFO", count=True, write=True),
+            dict(name="parse fallback", event="SPELL_DAMAGE",
+                 args=["truncated-fallback-line"],
+                 marker="truncated-fallback-line", count=True, write=True),
+            dict(name="unit died", event="UNIT_DIED",
+                 args=list(self.header("0000000000000000", "nil", 0, other, "Add",
+                                       68168)),
+                 marker="UNIT_DIED", count=True, write=True),
+            dict(name="resource energize", event="SPELL_ENERGIZE",
+                 args=self._spell_args(player, 1297, player, 1297, "1242475",
+                                       "Soul Immolation", "6.0000", "0.0000", "17",
+                                       "120"),
+                 marker="Soul Immolation", count=False, write=False),
+            dict(name="landed on player", event="SWING_DAMAGE_LANDED",
+                 args=self._swing_args(enemy, 68168, player, 1297, player,
+                                       "0000000000000000", "9170011"),
+                 marker="9170011", count=False, write=True),
+            dict(name="landed on npc, default", event="SWING_DAMAGE_LANDED",
+                 args=self._swing_args(player, 1297, enemy, 68168, enemy,
+                                       "0000000000000000", "9170012"),
+                 marker="9170012", count=False, write=False),
+            dict(name="landed on npc, keep flag", keep=True,
+                 event="SWING_DAMAGE_LANDED",
+                 args=self._swing_args(player, 1297, enemy, 68168, enemy,
+                                       "0000000000000000", "9170013"),
+                 marker="9170013", count=False, write=True),
+            dict(name="player damage to npc, default", event="SPELL_DAMAGE",
+                 args=self._damage_args(player, 1297, enemy, 68168, "Outgoing Strike",
+                                        "700"),
+                 marker="Outgoing Strike", count=True, write=False, damage_done=700),
+            dict(name="player damage to npc, keep flag", keep=True,
+                 event="SPELL_DAMAGE",
+                 args=self._damage_args(player, 1297, enemy, 68168, "Outgoing Strike",
+                                        "700"),
+                 marker="Outgoing Strike", count=True, write=True, damage_done=700),
+            dict(name="own pet damage to npc", prime=[summon], event="SPELL_DAMAGE",
+                 args=self._damage_args(pet, 4370, enemy, 68168, "Pet Strike", "500"),
+                 marker="Pet Strike", count=True, write=False, damage_done=500),
+            dict(name="outgoing absorb on npc shield", event="SPELL_ABSORBED",
+                 args=list(self.header(player, "Src", 1297, enemy, "Dst", 68168)) + [
+                     "52212", q("Death and Decay"), "0x20", enemy, q("Dst"), "0xa48",
+                     "0x0", "1238158", q("Pollination"), "0x1", "1373", "1256", "nil"],
+                 marker="Pollination", count=True, write=False, damage_done=0),
+            dict(name="npc damage on player", event="SPELL_DAMAGE",
+                 args=self._damage_args(enemy, 68168, player, 1297, "Incoming Bolt",
+                                        "900"),
+                 marker="Incoming Bolt", count=True, write=True),
+            dict(name="player miss on npc", event="SPELL_MISSED",
+                 args=self._spell_args(player, 1297, enemy, 68168, "8", "Bad Shot",
+                                       "IMMUNE"),
+                 marker="Bad Shot", count=True, write=True),
+            dict(name="player aura on npc", event="SPELL_AURA_APPLIED",
+                 args=self._spell_args(player, 1297, enemy, 68168, "9", "Crowd Control",
+                                       "DEBUFF"),
+                 marker="Crowd Control", count=True, write=True),
+            dict(name="unowned pet heals unowned pet", event="SPELL_HEAL",
+                 args=self._spell_args(self.STRAY_PET, 4370, second_pet, 4370, "10",
+                                       "Pet Lick", "20", "0", "0", "0"),
+                 marker="Pet Lick", count=False, write=False),
+            dict(name="owned pet heals itself", prime=[summon], event="SPELL_HEAL",
+                 args=self._spell_args(pet, 4370, pet, 4370, "13", "Pet Mend",
+                                       "30", "0", "0", "0"),
+                 marker="Pet Mend", count=True, write=True),
+            dict(name="unknown npc to unknown npc", event="SPELL_DAMAGE",
+                 args=self._damage_args(other, 68168, enemy, 68168, "NPC chatter", "1"),
+                 marker="NPC chatter", count=False, write=False),
+            dict(name="player cast on npc", event="SPELL_CAST_SUCCESS",
+                 args=self._spell_args(player, 1297, enemy, 68168, "11", "Big Cast"),
+                 marker="Big Cast", count=True, write=True),
+            dict(name="heal landing on own pet", prime=[summon], event="SPELL_HEAL",
+                 args=self._spell_args(enemy, 68168, pet, 4370, "12", "Mend Pet",
+                                       "40", "0", "0", "0"),
+                 marker="Mend Pet", count=True, write=True),
+        ]
+        for case in cases:
+            with self.subTest(row=case["name"]):
+                session = self._session(
+                    keep_player_damage=case.get("keep", False))
+                start = datetime(2026, 8, 30, 20, 0, 0)
+                for index, (event, args) in enumerate(case.get("prime", [])):
+                    self._feed(session, start + timedelta(milliseconds=index), event,
+                               args)
+                self._feed(session, start + timedelta(seconds=1), case["event"],
+                           case["args"])
+                self.assertEqual(case["event"] in session.event_counts, case["count"],
+                                 "count for %s" % case["name"])
+                if "damage_done" in case:
+                    self.assertEqual(session.players[self.PLAYER]["damage_done"],
+                                     case["damage_done"], "damage for %s" % case["name"])
+                combat = self._combat_of(session)
+                self.assertEqual(case["marker"] in combat, case["write"],
+                                 "write for %s" % case["name"])
+
+    def test_resource_events_leave_no_trace_in_combat_counts_or_death_window(self):
+        session = self._session()
+        start = datetime(2026, 8, 30, 20, 0, 0)
+        self._feed(session, start, "SPELL_DAMAGE",
+                   self._damage_args(self.ENEMY, 68168, self.PLAYER, 1297,
+                                     "Incoming Bolt", "900"))
+        energize = self._spell_args(self.PLAYER, 1297, self.PLAYER, 1297,
+                                    "1242475", "Soul Immolation", self.PLAYER,
+                                    "0000000000000000")
+        self._feed(session, start + timedelta(seconds=1), "SPELL_ENERGIZE",
+                   energize + self.ADVANCED_TAIL + ["6.0000", "0.0000", "17", "120"])
+        death_time = start + timedelta(seconds=2)
+        self._feed(session, death_time, "UNIT_DIED",
+                   list(self.header("0000000000000000", "nil", 0, self.PLAYER,
+                                    "Dst", 1297)))
+        self.assertNotIn("SPELL_ENERGIZE", session.event_counts)
+        combat = self._combat_of(session)
+        self.assertNotIn("Soul Immolation", combat)
+        death = session.deaths()[0]
+        self.assertNotIn("SPELL_ENERGIZE",
+                         [event["event"] for event in death["events"]])
+        self.assertNotIn("Soul Immolation", json.dumps(death, ensure_ascii=False))
+
+    def test_swing_and_landed_pair_report_one_amount_and_the_victim_state(self):
+        session = self._session()
+        start = datetime(2026, 8, 30, 20, 0, 0)
+        self._feed(session, start, "SWING_DAMAGE",
+                   self._swing_args(self.ENEMY, 68168, self.PLAYER, 1297,
+                                    self.ENEMY, "0000000000000000", "2131"))
+        self._feed(session, start + timedelta(milliseconds=1),
+                   "SWING_DAMAGE_LANDED",
+                   self._swing_args(self.ENEMY, 68168, self.PLAYER, 1297,
+                                    self.PLAYER, "0000000000000000", "2131"))
+        death_time = start + timedelta(seconds=2)
+        self._feed(session, death_time, "UNIT_DIED",
+                   list(self.header("0000000000000000", "nil", 0, self.PLAYER,
+                                    "Dst", 1297)))
+        self.assertEqual(session.players[self.PLAYER]["damage_taken"], 2131)
+        self.assertEqual(session.event_counts.get("SWING_DAMAGE"), 1)
+        self.assertNotIn("SWING_DAMAGE_LANDED", session.event_counts)
+        combat = self._combat_of(session)
+        self.assertEqual(combat.count("  SWING_DAMAGE,"), 1)
+        self.assertEqual(combat.count("  SWING_DAMAGE_LANDED,"), 1)
+        events = [event for event in session.deaths()[0]["events"]
+                  if event["event"].startswith("SWING_DAMAGE")]
+        self.assertEqual(len(events), 2)
+        self.assertEqual([event for event in events if "amount" in event][0]["event"],
+                         "SWING_DAMAGE")
+        landed = next(event for event in events
+                      if event["event"] == "SWING_DAMAGE_LANDED")
+        self.assertTrue(landed["supplemental_state"])
+        self.assertIn("target_hp", landed)
+        self.assertEqual(landed["target_hp"], 375809)
+        self.assertEqual(landed["target_max_hp"], 375809)
+        self.assertNotIn("amount", landed)
+        self.assertNotIn("absorbed", landed)
+
+    def test_outgoing_results_hidden_by_default_keep_identical_damage_done(self):
+        totals = {}
+        for keep in (False, True):
+            with self.subTest(keep_player_damage=keep):
+                session = self._session(keep_player_damage=keep)
+                start = datetime(2026, 8, 30, 20, 0, 0)
+                self._feed(session, start, "SPELL_SUMMON", self._summon_args(self.PET))
+                self._feed(session, start + timedelta(seconds=1), "SPELL_DAMAGE",
+                           self._damage_args(self.PLAYER, 1297, self.ENEMY, 68168,
+                                             "Outgoing Strike", "700"))
+                self._feed(session, start + timedelta(seconds=2), "SPELL_DAMAGE",
+                           self._damage_args(self.PET, 4370, self.ENEMY, 68168,
+                                             "Pet Strike", "500"))
+                self._feed(session, start + timedelta(seconds=3), "SWING_DAMAGE",
+                           self._swing_args(self.PLAYER, 1297, self.ENEMY, 68168,
+                                            self.PLAYER, "0000000000000000", "300777"))
+                self._feed(session, start + timedelta(seconds=4),
+                           "SWING_DAMAGE_LANDED",
+                           self._swing_args(self.PLAYER, 1297, self.ENEMY, 68168,
+                                            self.ENEMY, "0000000000000000", "300778"))
+                totals[keep] = session.players[self.PLAYER]["damage_done"]
+                combat = self._combat_of(session)
+                for marker in ("Outgoing Strike", "Pet Strike", "300777", "300778"):
+                    self.assertEqual(marker in combat, keep, marker)
+        self.assertEqual(totals[False], totals[True])
+        self.assertEqual(totals[False], 700 + 500 + 300777)
+
+    def test_real_pet_lines_link_the_owner_through_the_source_block(self):
+        _, event, args = wle.parse_line(self.REAL_SWING, 2026)
+        swing = wle.parse_combat_event(event, args)
+        self.assertEqual(swing.source_owner_guid, self.REAL_OWNER)
+        self.assertEqual(swing.amount, 2131)
+        self.assertIsNone(swing.target_hp)
+        _, event, args = wle.parse_line(self.REAL_PET_CAST, 2026)
+        cast = wle.parse_combat_event(event, args)
+        self.assertEqual(cast.source_owner_guid, self.REAL_OWNER)
+        self.assertEqual(cast.spell_id, 108446)
+        self.assertIsNone(cast.target_hp)
+
+    def test_real_swing_tail_reads_absorbed_from_the_modern_offset(self):
+        # Modern swing tail: amount, base, overkill, school, resisted, blocked,
+        # absorbed, ... (10 fields, no ST/AOE marker). blocked=5 and absorbed=7 make
+        # an off-by-one read observable.
+        line = self.REAL_SWING.replace("2131,3044,-1,1,0,0,0,nil,nil,nil",
+                                       "2131,3044,-1,1,0,5,7,nil,nil,nil")
+        _, event, args = wle.parse_line(line, 2026)
+        parsed = wle.parse_combat_event(event, args)
+        self.assertEqual(parsed.amount, 2131)
+        self.assertEqual(parsed.absorbed, 7)
+        landed = self.REAL_LANDED.replace("109161,288458,-1,1,0,0,0,nil,nil,nil",
+                                          "109161,288458,-1,1,0,5,7,nil,nil,nil")
+        _, event, args = wle.parse_line(landed, 2026)
+        self.assertEqual(wle.parse_combat_event(event, args).absorbed, 7)
+
+    def test_real_landed_line_is_parsed_as_supplemental_victim_state(self):
+        _, event, args = wle.parse_line(self.REAL_LANDED, 2026)
+        parsed = wle.parse_combat_event(event, args)
+        self.assertEqual(parsed.amount, 109161)
+        self.assertEqual((parsed.target_hp, parsed.target_max_hp), (1045159, 1154320))
+        data = parsed.as_dict(datetime(2026, 8, 30, 10, 23, 26), b"raw")
+        self.assertTrue(data["supplemental_state"])
+        self.assertNotIn("amount", data)
+        self.assertNotIn("absorbed", data)
+        self.assertEqual(data["target_hp"], 1045159)
+
+    def test_pet_is_linked_by_its_source_block_before_any_summon(self):
+        session = self._session()
+        start = datetime(2026, 8, 30, 20, 0, 0)
+        self._feed_real(session, start, self.REAL_PET_CAST)
+        self.assertEqual(session.pet_owners.get(self.REAL_PET), self.REAL_OWNER)
+        self.assertIn(self.REAL_OWNER, session.players)
+        self.assertEqual(session.players[self.REAL_OWNER]["pets"], [self.REAL_PET])
+        self._feed(session, start + timedelta(seconds=1), "SPELL_DAMAGE",
+                   self._damage_args(self.REAL_PET, 4370, self.ENEMY, 68168,
+                                     "Pet Strike", "500"))
+        self.assertEqual(session.players[self.REAL_OWNER]["damage_done"], 500)
+
+    def test_source_block_owner_is_ignored_when_it_is_not_a_player(self):
+        for owner in ("nil", "0000000000000000",
+                      "Creature-0-3891-2859-182905-245336-000513F705"):
+            with self.subTest(owner=owner):
+                session = self._session()
+                start = datetime(2026, 8, 30, 20, 0, 0)
+                args = list(self.header(self.REAL_PET, "Ghaazun", 4370,
+                                        "0000000000000000", "nil", 0)) + [
+                    "108446", q("Enlace de alma"), "0x20", self.REAL_PET, owner] + \
+                    self.ADVANCED_TAIL
+                self._feed(session, start, "SPELL_CAST_SUCCESS", args)
+                self.assertNotIn(self.REAL_PET, session.pet_owners)
+
+    def test_hostile_pet_with_a_player_owner_stays_hostile_and_unowned(self):
+        session = self._session()
+        start = datetime(2026, 8, 30, 20, 0, 0)
+        hostile_pet_flags = 4370 | wle.REACTION_HOSTILE
+        args = list(self.header(self.REAL_PET, "Enemy pet", hostile_pet_flags,
+                                self.PLAYER, "Dst", 1297)) + [
+            "7", q("Enemy Bite"), "1", self.REAL_PET, self.REAL_OWNER] + \
+            self.ADVANCED_TAIL + ["400", "0", "1", "0", "0", "0"]
+        self._feed(session, start, "SPELL_DAMAGE", args)
+        self.assertNotIn(self.REAL_PET, session.pet_owners)
+        self.assertNotIn(self.REAL_OWNER, session.players)
+        self.assertIn(self.REAL_PET, session.hostiles)
+        self.assertEqual(session.players[self.PLAYER]["damage_taken"], 400)
+        self.assertIn("Enemy Bite", self._combat_of(session))
+
+    def test_pet_owner_beyond_the_player_cap_neither_breaks_nor_attributes(self):
+        with mock.patch.object(wle, "MAX_PLAYER_AGGREGATES", 1):
+            session = self._session()
+            start = datetime(2026, 8, 30, 20, 0, 0)
+            self._feed(session, start, "SPELL_CAST_SUCCESS",
+                       self._spell_args(self.PLAYER, 1297, self.ENEMY, 68168, "11",
+                                        "Big Cast"))
+            self._feed_real(session, start + timedelta(seconds=1), self.REAL_PET_CAST)
+            self._feed(session, start + timedelta(seconds=2), "SPELL_DAMAGE",
+                       self._damage_args(self.REAL_PET, 4370, self.ENEMY, 68168,
+                                         "Pet Strike", "500"))
+            self.assertEqual(session.pet_owners.get(self.REAL_PET), self.REAL_OWNER)
+            self.assertEqual(list(session.players), [self.PLAYER])
+            self.assertEqual(session.players[self.PLAYER]["damage_done"], 0)
+            self.assertIn("player_aggregates_truncated", session.warnings)
+
+    def test_combatant_info_item_level_is_deterministic_and_tolerant(self):
+        prefix = [self.PLAYER] + ["0"] * 23 + ["65", "[(90929,112839,1)]",
+                                               "(0,354489,1261697,205596)"]
+        cases = [
+            ("[(1,300,(),(),()),(2,320,(),(),())]", 310),
+            ("[]", None),
+            ("[(1,0,(),(),()),(2,0,(),(),())]", None),
+            ("[(1,300,(),(),()),(2),(3,0,(),(),()),(4,320,(),(),())]", 310),
+            ("[(1,300,(),(),()", None),
+            (None, None),
+        ]
+        for equipment, expected in cases:
+            with self.subTest(equipment=equipment):
+                args = list(prefix)
+                if equipment is not None:
+                    args.append(equipment)
+                args.extend(["[]", "85", "0", "0", "0"])
+                parsed = wle.parse_combat_event("COMBATANT_INFO", args)
+                self.assertEqual(parsed.spec_id, 65)
+                self.assertEqual(parsed.item_level, expected)
+                self.assertIsNone(parsed.amount)
+                self.assertIsNone(parsed.spell_id)
+        # One stat column fewer (an older client) must not move spec or equipment.
+        shorter = [self.PLAYER] + ["0"] * 22 + ["65", "[(90929,112839,1)]",
+                                                "(0,0,0,0)",
+                                                "[(1,300,(),(),()),(2,320,(),(),())]",
+                                                "[]", "85", "0", "0", "0"]
+        parsed = wle.parse_combat_event("COMBATANT_INFO", shorter)
+        self.assertEqual((parsed.spec_id, parsed.item_level), (65, 310))
+
+    def test_combatant_info_with_a_broken_equipment_array_is_still_retained(self):
+        session = self._session()
+        start = datetime(2026, 8, 30, 20, 0, 0)
+        info = [self.PLAYER] + ["0"] * 23 + [
+            "65", "[(90929,112839,1)]", "(0,0,0,0)", "[(1,300,(),(),()", "[]", "85"]
+        self._feed(session, start, "COMBATANT_INFO", info)
+        self.assertEqual(session.players[self.PLAYER]["spec_id"], 65)
+        self.assertIsNone(session.players[self.PLAYER]["item_level"])
+        self.assertIn("COMBATANT_INFO", self._combat_of(session))
+
+    def test_real_combatant_info_yields_spec_and_a_plausible_item_level(self):
+        _, event, args = wle.parse_line(self.REAL_COMBATANT_INFO, 2026)
+        parsed = wle.parse_combat_event(event, args)
+        self.assertEqual(parsed.spec_id, 1480)
+        self.assertEqual(parsed.item_level, 309)
+        self.assertIsNone(parsed.spell_id)
+        self.assertIsNone(parsed.amount)
+
+    def test_combatant_info_in_a_death_window_serializes_spec_and_item_level(self):
+        session = self._session()
+        start = datetime(2026, 8, 30, 20, 0, 0)
+        info = [self.PLAYER] + ["0"] * 23 + [
+            "65", "[(90929,112839,1)]", "(0,0,0,0)",
+            "[(1,300,(),(),()),(2,320,(),(),())]", "[]", "85", "0", "0", "0"]
+        self._feed(session, start, "COMBATANT_INFO", info)
+        self._feed(session, start + timedelta(seconds=1), "SPELL_DAMAGE",
+                   self._damage_args(self.ENEMY, 68168, self.PLAYER, 1297,
+                                     "Incoming Bolt", "900"))
+        death_time = start + timedelta(seconds=2)
+        self._feed(session, death_time, "UNIT_DIED",
+                   list(self.header("0000000000000000", "nil", 0, self.PLAYER,
+                                    "Dst", 1297)))
+        self.assertEqual(session.players[self.PLAYER]["spec_id"], 65)
+        self.assertEqual(session.players[self.PLAYER]["class_id"], 2)
+        self.assertEqual(session.players[self.PLAYER]["item_level"], 310)
+        session.close_streams()
+        serialized = next(event for event in session.deaths()[0]["events"]
+                          if event["event"] == "COMBATANT_INFO")
+        self.assertEqual(serialized["spec_id"], 65)
+        self.assertEqual(serialized["item_level"], 310)
+        self.assertNotIn("spell_id", serialized)
+        self.assertNotIn("amount", serialized)
+
+    def test_enemy_cast_successes_are_named_and_deterministically_ordered(self):
+        session = self._session()
+        start = datetime(2026, 8, 30, 20, 0, 0)
+        self._feed(session, start, "SPELL_DAMAGE",
+                   self._damage_args(self.ENEMY, 68168, self.PLAYER, 1297,
+                                     "Incoming Bolt", "900"))
+        casts = [("1238066", "Alpha")] * 3 + [("7", "Beta"), ("9", "Delta"),
+                                              ("nil", "Gamma")]
+        for index, (spell_id, name) in enumerate(casts):
+            self._feed(session, start + timedelta(seconds=index + 1),
+                       "SPELL_CAST_SUCCESS",
+                       self._spell_args(self.ENEMY, 68168, self.PLAYER, 1297,
+                                        spell_id, name))
+        summary, _ = session.summary_and_players({})
+        self.assertEqual(summary["enemy_cast_successes"], [
+            {"spell_id": 1238066, "spell_name": "Alpha", "count": 3},
+            {"spell_id": 7, "spell_name": "Beta", "count": 1},
+            {"spell_id": 9, "spell_name": "Delta", "count": 1},
+            {"spell_id": None, "spell_name": "Gamma", "count": 1},
+        ])
+
+    def test_analysis_v2_shapes_are_exact_in_the_files_and_in_the_zip(self):
+        _, basename = self._run_analysis_raid(analysis=True, bundle=True)
+        analysis_dir = self._analysis_dir(basename)
+        players_document = self.read_json(os.path.join(analysis_dir, "players.json"))
+        self.assertEqual(list(players_document), ["players"])
+        self.assertTrue(all(set(row) >= {"guid", "class_id", "item_level", "spec_id"}
+                            for row in players_document["players"]))
+        summary = self.read_json(os.path.join(analysis_dir, "summary.json"))
+        self.assertEqual(summary["analysis_schema_version"], 2)
+        self.assertIsInstance(summary["enemy_cast_successes"], list)
+        for row in summary["enemy_cast_successes"]:
+            self.assertEqual(sorted(row), ["count", "spell_id", "spell_name"])
+        self.assertEqual(summary["interrupts"][0]["interrupted_spell_id"], 9001)
+        self.assertEqual(summary["interrupts"][0]["interrupted_spell"], "Dark Bolt")
+        self.assertEqual(summary["dispels"][0]["dispelled_spell_id"], 123)
+        self.assertNotIn("extra_spell", json.dumps(summary, ensure_ascii=False))
+        death = self.read_json(os.path.join(analysis_dir, "deaths.json"))[0]
+        self.assertNotIn("extra_spell", json.dumps(death, ensure_ascii=False))
+        interrupt = next(event for event in death["events"]
+                         if event["event"] == "SPELL_INTERRUPT")
+        self.assertEqual(interrupt["interrupted_spell_id"], 9001)
+        dispel = next(event for event in death["events"]
+                      if event["event"] == "SPELL_DISPEL")
+        self.assertEqual(dispel["dispelled_spell"], "Debuff")
+        metadata = self.read_json(os.path.join(analysis_dir, "metadata.json"))
+        self.assertEqual(metadata["options"]["keep_player_damage"], False)
+        archive = os.path.join(self.raids_dir(), basename + "_analysis.zip")
+        with zipfile.ZipFile(archive) as bundle:
+            self.assertEqual(list(json.loads(bundle.read("players.json"))), ["players"])
+            self.assertIsInstance(
+                json.loads(bundle.read("summary.json"))["enemy_cast_successes"], list)
+
+    def test_hostile_lookback_neither_resurrects_dropped_lines_nor_double_counts(self):
+        session = self._session()
+        start = datetime(2026, 8, 30, 20, 0, 0)
+        self._feed(session, start, "SPELL_CAST_SUCCESS",
+                   self._spell_args(self.ENEMY, 68168, self.OTHER_ENEMY, 68168,
+                                    "11", "Silent Cast"))
+        energize = self._spell_args(self.ENEMY, 68168, self.ENEMY, 68168,
+                                    "1242475", "Soul Immolation", self.ENEMY,
+                                    "0000000000000000")
+        self._feed(session, start + timedelta(seconds=1), "SPELL_ENERGIZE",
+                   energize + self.ADVANCED_TAIL + ["6.0000", "0.0000", "17", "120"])
+        self._feed(session, start + timedelta(seconds=2), "SPELL_DAMAGE",
+                   self._damage_args(self.ENEMY, 68168, self.PLAYER, 1297,
+                                     "Incoming Bolt", "900"))
+        self.assertEqual(session.event_counts["SPELL_CAST_SUCCESS"], 1)
+        self.assertNotIn("SPELL_ENERGIZE", session.event_counts)
+        # Re-running the look-back must be a no-op, not a second count.
+        session.hostiles.pop(self.ENEMY)
+        session._mark_hostile(self.ENEMY, start + timedelta(seconds=3))
+        self.assertEqual(session.event_counts["SPELL_CAST_SUCCESS"], 1)
+        combat = self._combat_of(session)
+        self.assertIn("Silent Cast", combat)
+        self.assertNotIn("Soul Immolation", combat)
+
+    def _published_analysis_dir(self):
+        basename = next(name for name in self.list_outputs(self.raids_dir())
+                        if os.path.isdir(os.path.join(self.raids_dir(), name)))
+        return self._analysis_dir(basename)
+
+    def _published_marker(self):
+        return self.read_json(os.path.join(self._published_analysis_dir(),
+                                           "metadata.json"))
+
+    def _published_combat(self):
+        with open(os.path.join(self._published_analysis_dir(), "combat.txt"),
+                  encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_switching_keep_player_damage_backfills_once_in_each_direction(self):
+        """Flags own the shared artifacts, so switching back must republish them."""
+        self.write_log(self._build_raid_with_actor_events().data())
+        compact = self.options(analysis_only=True)
+        verbose = self.options(analysis_only=True, keep_player_damage=True)
+        for options, expected, marker_profile in ((compact, False, compact.profile),
+                                                  (verbose, True, verbose.profile),
+                                                  (compact, False, compact.profile)):
+            extractor = self.make_extractor(options)
+            extractor.prepare()
+            self.assertEqual(extractor.run_once(), (0, 1, 0), marker_profile)
+            self.assertEqual(extractor.run_once(), (0, 0, 0), marker_profile)
+            self.assertEqual(self._published_marker()["profile"], marker_profile)
+            self.assertEqual("Sinister Strike" in self._published_combat(), expected)
+        entry = self.read_json(self.state_path)["files"][LOG_NAME]
+        self.assertEqual(list(entry["profiles"]), [compact.profile])
+
+    def test_republish_under_another_profile_leaves_no_stale_marker_on_crash(self):
+        self.write_log(self._build_raid_with_actor_events().data())
+        compact = self.options(analysis_only=True)
+        verbose = self.options(analysis_only=True, keep_player_damage=True)
+        first = self.make_extractor(compact)
+        first.prepare()
+        self.assertEqual(first.run_once(), (0, 1, 0))
+        analysis_dir = self._published_analysis_dir()
+        real_copy = wle._copy_atomic
+
+        def fail_on_deaths(source, destination):
+            if destination.endswith("deaths.json"):
+                raise OSError("simulated crash: deaths.json copy")
+            return real_copy(source, destination)
+
+        crashing = self.make_extractor(verbose)
+        crashing.prepare()
+        with mock.patch.object(wle, "_copy_atomic", side_effect=fail_on_deaths):
+            self.assertEqual(crashing.run_once(), (0, 0, 1))
+        # The old marker described the compact package that is now half replaced.
+        self.assertFalse(os.path.exists(os.path.join(analysis_dir, "metadata.json")),
+                         self.list_outputs(analysis_dir))
+        retry = self.make_extractor(verbose)
+        retry.prepare()
+        self.assertEqual(retry.run_once(), (0, 1, 0))
+        self.assertEqual(len([name for name in self.list_outputs(self.raids_dir())
+                              if os.path.isdir(os.path.join(self.raids_dir(), name))]), 1)
+        self.assertEqual(self._published_analysis_dir(), analysis_dir)
+        self.assertEqual(sorted(self.list_outputs(analysis_dir)),
+                         ["combat.txt", "deaths.json", "metadata.json", "players.json",
+                          "summary.json"])
+        self.assertEqual(self._published_marker()["profile"], verbose.profile)
+        self.assertIn("Sinister Strike", self._published_combat())
+
+    def test_previous_profile_repairs_a_package_left_broken_by_another_profiles_crash(self):
+        # A publishes, B crashes half-way through replacing A's package, then the user
+        # goes back to A. A's old EOF offset must not suppress the repair.
+        self.write_log(self._build_raid_with_actor_events().data())
+        compact = self.options(analysis_only=True)
+        verbose = self.options(analysis_only=True, keep_player_damage=True)
+        first = self.make_extractor(compact)
+        first.prepare()
+        self.assertEqual(first.run_once(), (0, 1, 0))
+        analysis_dir = self._published_analysis_dir()
+        real_copy = wle._copy_atomic
+
+        def fail_on_deaths(source, destination):
+            if destination.endswith("deaths.json"):
+                raise OSError("simulated crash: deaths.json copy")
+            return real_copy(source, destination)
+
+        crashing = self.make_extractor(verbose)
+        crashing.prepare()
+        with mock.patch.object(wle, "_copy_atomic", side_effect=fail_on_deaths):
+            self.assertEqual(crashing.run_once(), (0, 0, 1))
+        self.assertFalse(os.path.exists(os.path.join(analysis_dir, "metadata.json")))
+        back = self.make_extractor(compact)
+        back.prepare()
+        self.assertEqual(back.run_once(), (0, 1, 0))
+        self.assertEqual(self._published_analysis_dir(), analysis_dir)
+        self.assertEqual(sorted(self.list_outputs(analysis_dir)),
+                         ["combat.txt", "deaths.json", "metadata.json", "players.json",
+                          "summary.json"])
+        self.assertEqual(self._published_marker()["profile"], compact.profile)
+        self.assertNotIn("Sinister Strike", self._published_combat())
+        again = self.make_extractor(compact)
+        again.prepare()
+        self.assertEqual(again.run_once(), (0, 0, 0))
+        state = self.read_json(self.state_path)
+        self.assertEqual(list(state["files"][LOG_NAME]["profiles"]), [compact.profile])
+
+    def test_gzip_republish_removes_the_other_containers_combat_body(self):
+        self.write_log(self._build_raid_with_actor_events().data())
+        plain = self.make_extractor(self.options(analysis_only=True))
+        plain.prepare()
+        self.assertEqual(plain.run_once(), (0, 1, 0))
+        compressed = self.make_extractor(self.options(analysis_only=True, gzip=True))
+        compressed.prepare()
+        self.assertEqual(compressed.run_once(), (0, 1, 0))
+        self.assertEqual(sorted(self.list_outputs(self._published_analysis_dir())),
+                         ["combat.txt.gz", "deaths.json", "metadata.json",
+                          "players.json", "summary.json"])
+
+    def test_owned_pet_self_heal_is_kept_and_credited_to_its_owner(self):
+        session = self._session()
+        start = datetime(2026, 8, 30, 20, 0, 0)
+        self._feed(session, start, "SPELL_SUMMON", self._summon_args(self.PET))
+        self._feed(session, start + timedelta(seconds=1), "SPELL_HEAL",
+                   self._spell_args(self.PET, 4370, self.PET, 4370, "13", "Pet Mend",
+                                    "300", "100", "0", "nil"))
+        owner = session.players[self.PLAYER]
+        self.assertEqual(owner["healing_done"], 200)
+        self.assertEqual(owner["healing_received"], 200)
+        self.assertEqual(owner["self_healing"], 200)
+        self.assertEqual(session.event_counts["SPELL_HEAL"], 1)
+        self.assertIn("Pet Mend", self._combat_of(session))
+
+    def test_unparseable_line_is_written_and_counted(self):
+        start = datetime(2026, 8, 30, 22, 0, 0)
+        builder = LogBuilder()
+        builder.add(start, "ENCOUNTER_START", "9300", q("Boss"), "16", "20", "2900")
+        self.add_event(builder, start + timedelta(seconds=1), "SPELL_DAMAGE",
+                       self.ENEMY, "Boss", 68168, self.PLAYER, "Player", 1297,
+                       "9001", q("Dark Bolt"), "32", "100", "0", "32", "0", "0", "0",
+                       "0")
+        builder.add_raw(b"no timestamp and no event marker\r\n")
+        builder.add(start + timedelta(seconds=3), "ENCOUNTER_END", "9300", q("Boss"),
+                    "16", "20", "1", "3000")
+        self.write_log(builder.data())
+        extractor = self.make_extractor(self.options(analysis_only=True))
+        extractor.prepare()
+        self.assertEqual(extractor.run_once(), (0, 1, 0))
+        self.assertIn("no timestamp and no event marker", self._published_combat())
+        summary = self.read_json(os.path.join(self._published_analysis_dir(),
+                                              "summary.json"))
+        self.assertEqual(summary["event_counts"]["UNPARSEABLE"], 1)
+        self.assertEqual(summary["parse_fallbacks"]["UNPARSEABLE"], 1)
+
     def test_help_lists_all_analysis_modes(self):
         help_text = wle.build_parser().format_help()
-        for flag in ("--analysis", "--analysis-only", "--gzip", "--bundle", "--watch"):
+        for flag in ("--analysis", "--analysis-only", "--gzip", "--bundle", "--watch",
+                     "--keep-player-damage"):
             self.assertIn(flag, help_text)
 
     def test_output_options_reject_invalid_analysis_combinations(self):
@@ -2044,12 +2751,17 @@ class AnalysisBundleTests(ExtractorTestCase):
             wle.OutputOptions(analysis=True, analysis_only=True)
         with self.assertRaises(ValueError):
             wle.OutputOptions(bundle=True)
+        with self.assertRaises(ValueError) as raised:
+            wle.OutputOptions(keep_player_damage=True)
+        self.assertIn("--keep-player-damage", str(raised.exception))
 
     def test_cli_rejects_invalid_analysis_combinations_before_path_resolution(self):
         with self.assertRaises(SystemExit):
             wle.run(["--analysis", "--analysis-only"])
         with self.assertRaises(SystemExit):
             wle.run(["--bundle"])
+        with self.assertRaises(SystemExit):
+            wle.run(["--keep-player-damage"])
 
 
 if __name__ == "__main__":
