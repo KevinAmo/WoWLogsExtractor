@@ -27,4 +27,14 @@ Para el análisis normal, comparte el directorio `analysis/` o usa `--bundle` pa
 
 Por defecto el análisis descarta de `combat.txt` los eventos de recursos (que no se cuentan en ningún sitio) y las líneas de resultado de daño saliente contra NPCs (que sí se siguen sumando en `players.json`); el log completo es siempre el fallback sin pérdida cuando algo no aparece en `combat.txt`.
 
+### Rendimiento de raid por jugador
+
+Para analizar un jugador en raid sin enviar los logs, añade `--performance-player` a un modo de análisis (solo pulls de raid, un jugador por ejecución):
+
+```text
+python WoWLogExtractor.py --analysis-only --performance-player Dkyam
+```
+
+Genera `analysis/performance.json` por pull (detalle local) y un `Diagnostics/<inicio>_<nombre>_<guid8>_diagnostic_packet.json` por sesión y jugador en la carpeta de salida: ese packet es el fichero que se comparte. Detalles, definiciones de métricas y límites de interpretación en la sección "Rendimiento de raid por jugador" de [WoWLogExtractor/README.md](WoWLogExtractor/README.md#rendimiento-de-raid-por-jugador).
+
 La guía completa, el layout de archivos y el significado de los JSON están en [WoWLogExtractor/README.md](WoWLogExtractor/README.md).
